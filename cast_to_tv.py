@@ -63,16 +63,34 @@ def needs_transcode(filepath):
 
 
 class TranscodeStream:
-    """Pipes ffmpeg MPEG-TS output through a dedicated HTTP endpoint. No temp file."""
+    """ffmpeg → memory buffer → HTTP. Supports reconnects, no temp file."""
 
     def __init__(self, port):
         self.port = port
         self.proc = None
         self.server = None
-        self.thread = None
+        self.buffer = bytearray()
+        self.lock = threading.Lock()
+        self.finished = False
+        self._reader_thread = None
+
+    def _reader(self):
+        """Read ffmpeg stdout into shared memory buffer."""
+        try:
+            while self.proc and self.proc.poll() is None:
+                chunk = self.proc.stdout.read(256 * 1024)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buffer.extend(chunk)
+        except Exception:
+            pass
+        self.finished = True
 
     def start(self, filepath, callback=None):
         self.stop()
+        self.buffer = bytearray()
+        self.finished = False
         cmd = [
             'ffmpeg', '-i', filepath,
             '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
@@ -81,9 +99,10 @@ class TranscodeStream:
         if callback:
             callback("[FFMPEG] Streaming transcode (video copy + AAC)...")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self._reader_thread.start()
 
-        # HTTP server that serves ffmpeg stdout
-        ffmpeg_proc = self.proc
+        stream = self  # reference for handler
 
         class StreamHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -92,12 +111,20 @@ class TranscodeStream:
                 self.send_header('transferMode.dlna.org', 'Streaming')
                 self.send_header('Connection', 'close')
                 self.end_headers()
+                pos = 0
                 try:
                     while True:
-                        chunk = ffmpeg_proc.stdout.read(256 * 1024)
-                        if not chunk:
+                        with stream.lock:
+                            available = len(stream.buffer) - pos
+                        if available > 0:
+                            with stream.lock:
+                                chunk = bytes(stream.buffer[pos:pos + 256 * 1024])
+                            self.wfile.write(chunk)
+                            pos += len(chunk)
+                        elif stream.finished:
                             break
-                        self.wfile.write(chunk)
+                        else:
+                            time.sleep(0.1)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     pass
 
@@ -111,10 +138,10 @@ class TranscodeStream:
             def log_message(self, format, *args):
                 pass
 
-        self.server = socketserver.TCPServer(('0.0.0.0', self.port), StreamHandler)
+        self.server = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), StreamHandler)
         self.server.allow_reuse_address = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -126,6 +153,8 @@ class TranscodeStream:
             except Exception:
                 pass
             self.server = None
+        self.buffer = bytearray()
+        self.finished = False
 
 # ============= 8-BIT KEYGEN MUSIC =============
 
