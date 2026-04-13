@@ -180,8 +180,10 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     def guess_type(self, path):
         ext = os.path.splitext(path)[1].lower()
         return {
-            '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
-            '.webm': 'video/webm', '.mov': 'video/quicktime',
+            '.mp4': 'video/mp4', '.mkv': 'video/x-mkv', '.avi': 'video/avi',
+            '.webm': 'video/webm', '.mov': 'video/quicktime', '.flv': 'video/flv',
+            '.ts': 'video/MP2T', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg',
+            '.wmv': 'video/x-ms-wmv', '.3gp': 'video/3gpp',
             '.srt': 'text/srt', '.sub': 'text/sub', '.smi': 'text/smi', '.vtt': 'text/vtt',
         }.get(ext, 'application/octet-stream')
 
@@ -241,8 +243,10 @@ class HTTPServerThread:
 # ============= DLNA FUNCTIONS =============
 
 MIME_MAP = {
-    '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
-    '.webm': 'video/webm', '.mov': 'video/quicktime',
+    '.mp4': 'video/mp4', '.mkv': 'video/x-mkv', '.avi': 'video/avi',
+    '.webm': 'video/webm', '.mov': 'video/quicktime', '.flv': 'video/flv',
+    '.ts': 'video/MP2T', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg',
+    '.wmv': 'video/x-ms-wmv', '.3gp': 'video/3gpp', '.asf': 'video/x-ms-asf',
 }
 
 def get_local_ip():
@@ -393,7 +397,7 @@ def scan_network_for_tv(prefix, callback=None, cancel_check=None):
 def find_dlna_service(tv_ip, callback=None, cancel_check=None):
     """Try common DLNA ports first (LG TV + WiFi dongles), then broader scan."""
     # LG TV ports + EZCast/AnyCast/MiraScreen dongle ports
-    priority_ports = [49152, 49153, 49154, 2020, 7000, 8008, 8060,
+    priority_ports = [49152, 49153, 49154, 49595, 2020, 7000, 8008, 8060,
                       1780, 1782, 1790, 2700, 1800, 8080, 9000, 1900]
     all_ports = priority_ports + [p for p in range(1000, 50000) if p not in priority_ports]
 
