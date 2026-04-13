@@ -35,60 +35,166 @@ def check_ffmpeg():
 
 HAS_FFMPEG = check_ffmpeg()
 
-import tempfile
-
 def probe_file(filepath):
-    """Return audio codec and total bitrate."""
+    """Return audio codec, video codec, bitrate, duration."""
     if not HAS_FFMPEG:
-        return '', 0
+        return {}, 0, 0
     try:
         result = subprocess.run([
             'ffprobe', '-v', 'error',
             '-show_entries', 'stream=codec_name,codec_type',
-            '-show_entries', 'format=bit_rate',
+            '-show_entries', 'format=bit_rate,duration',
             '-of', 'json', filepath
         ], capture_output=True, text=True, timeout=10)
         info = json.loads(result.stdout)
-        acodec = ''
+        codecs = {}
         for s in info.get('streams', []):
-            if s.get('codec_type') == 'audio':
-                acodec = s.get('codec_name', '')
+            codecs[s.get('codec_type', '')] = s.get('codec_name', '')
         bitrate = int(info.get('format', {}).get('bit_rate', 0))
-        return acodec, bitrate
+        duration = float(info.get('format', {}).get('duration', 0))
+        return codecs, bitrate, duration
     except Exception:
-        return '', 0
+        return {}, 0, 0
 
-def needs_transcode(filepath):
-    """Check if file needs transcoding. Returns (reason, needs_video_reencode)."""
-    acodec, bitrate = probe_file(filepath)
-    bad_audio = acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp')
-    high_bitrate = bitrate > 4_000_000  # >4 Mbit/s too much for WiFi dongles
-    if bad_audio and high_bitrate:
-        return f'audio:{acodec}+bitrate:{bitrate//1000}k', True
-    if bad_audio:
-        return f'audio:{acodec}', False
-    if high_bitrate:
-        return f'bitrate:{bitrate//1000}k', True
-    return None, False
+def needs_audio_transcode(filepath):
+    """Check if audio needs transcoding (AC3/DTS → AAC). Returns reason or None."""
+    codecs, _, _ = probe_file(filepath)
+    acodec = codecs.get('audio', '')
+    if acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp'):
+        return f'audio:{acodec}'
+    return None
 
-def start_transcode(filepath, output_path, reencode_video=False, callback=None):
-    """Start ffmpeg: normal MP4 with faststart. Returns Popen."""
-    if reencode_video:
-        vcmd = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'film',
-                '-b:v', '1500k', '-maxrate', '2000k', '-bufsize', '4000k',
-                '-vf', 'scale=-2:480']
+def format_duration(seconds):
+    """Convert seconds to HH:MM:SS."""
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    s = int(seconds) % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+class DongleCaster:
+    """MPEG-TS memory buffer caster for WiFi dongles (ElfCast/AnyCast/etc)."""
+
+    def __init__(self, port):
+        self.port = port
+        self.proc = None
+        self.srv = None
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        self.done = False
+        self.served = 0
+
+    def start(self, filepath, seek=None, callback=None):
+        """Start ffmpeg → MPEG-TS → memory buffer → HTTP server."""
+        self.stop()
+        self.buf = bytearray()
+        self.done = False
+        self.served = 0
+
+        codecs, bitrate, duration = probe_file(filepath)
+        acodec = codecs.get('audio', '')
+        bad_audio = acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp')
+        self.duration = format_duration(duration)
+
+        # Build ffmpeg command
+        cmd = ['ffmpeg']
+        if seek:
+            cmd += ['-ss', seek]
+        cmd += ['-i', filepath, '-c:v', 'copy']
+        if bad_audio:
+            cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k']
+            if callback:
+                callback(f"[FFMPEG] audio {acodec}→AAC")
+        else:
+            cmd += ['-c:a', 'copy']
+        if seek:
+            cmd += ['-output_ts_offset', seek]
+        cmd += ['-f', 'mpegts', 'pipe:1']
+
         if callback:
-            callback("[FFMPEG] Transcoding video 480p@1.5M + audio AAC...")
-    else:
-        vcmd = ['-c:v', 'copy']
-        if callback:
-            callback("[FFMPEG] Remuxing video + transcoding audio AAC...")
+            callback(f"[FFMPEG] Buffering...")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    cmd = (['ffmpeg', '-i', filepath] + vcmd +
-           ['-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-            '-movflags', '+faststart',
-            '-y', output_path])
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Reader thread
+        def reader():
+            while self.proc and self.proc.poll() is None:
+                chunk = self.proc.stdout.read(256 * 1024)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buf.extend(chunk)
+            self.done = True
+        threading.Thread(target=reader, daemon=True).start()
+
+        # Wait for 50MB buffer
+        for _ in range(120):
+            time.sleep(0.5)
+            with self.lock:
+                sz = len(self.buf)
+            if sz > 50 * 1024 * 1024:
+                break
+            if self.proc.poll() is not None:
+                break
+        if callback:
+            callback(f"[FFMPEG] Ready ({sz // 1024 // 1024}MB)")
+
+        # HTTP server
+        caster = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.end_headers()
+                pos = 0
+                stall = 0
+                try:
+                    while stall < 100:
+                        with caster.lock:
+                            avail = len(caster.buf) - pos
+                        if avail > 0:
+                            with caster.lock:
+                                chunk = bytes(caster.buf[pos:pos + 64 * 1024])
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            pos += len(chunk)
+                            caster.served = max(caster.served, pos)
+                            stall = 0
+                        elif caster.done:
+                            break
+                        else:
+                            time.sleep(0.1)
+                            stall += 1
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
+        self.srv.allow_reuse_address = True
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc = None
+        if self.srv:
+            try:
+                self.srv.shutdown()
+            except Exception:
+                pass
+            self.srv = None
+        self.buf = bytearray()
+        self.done = False
 
 # ============= 8-BIT KEYGEN MUSIC =============
 
@@ -503,7 +609,7 @@ def find_dlna_service(tv_ip, callback=None, cancel_check=None):
 
 # ---------- Cast / Stop ----------
 
-def cast_video(video_url, control_url, subtitle_url=None, video_mime='video/mp4'):
+def cast_video(video_url, control_url, subtitle_url=None, video_mime='video/mp4', duration=None):
     sub_meta = ''
     if subtitle_url:
         sub_ext = os.path.splitext(subtitle_url.split('?')[0])[1].lstrip('.').lower()
@@ -519,7 +625,8 @@ def cast_video(video_url, control_url, subtitle_url=None, video_mime='video/mp4'
             f'<item id="0" parentID="-1" restricted="1">'
             f'<dc:title>Video</dc:title>'
             f'<upnp:class>object.item.videoItem.movie</upnp:class>'
-            f'<res protocolInfo="http-get:*:{video_mime}:*">'
+            f'<res protocolInfo="http-get:*:{video_mime}:*"'
+            f'{f" duration=&quot;{duration}&quot;" if duration else ""}>'
             f'{video_url}</res>'
             f'{sub_meta}'
             f'</item></DIDL-Lite>')
@@ -658,6 +765,8 @@ class KeygenApp:
         self.music = ChiptunePlayer()
         self.music_on = False
         self.current_cast = None
+        self._current_file = None
+        self._seek_pos = 0
         self.http_server = None
 
         self.build_ui()
@@ -931,20 +1040,33 @@ class KeygenApp:
         threading.Thread(target=run, daemon=True).start()
 
     def do_seek(self, delta_secs):
-        """Seek relative to current position."""
-        if not self.discovered_device:
+        """Seek by restarting ffmpeg with new -ss offset."""
+        if not self.discovered_device or not self._current_file:
             return
         def run():
             try:
                 control = self.discovered_device['control_url']
-                pos, dur = get_position(control)
+                # Try getting current position from DLNA
+                try:
+                    pos, dur = get_position(control)
+                except Exception:
+                    pos, dur = self._seek_pos, 0
                 new_pos = max(0, pos + delta_secs)
-                if dur > 0:
-                    new_pos = min(new_pos, dur - 1)
-                h, m, s = new_pos // 3600, (new_pos % 3600) // 60, new_pos % 60
-                time_str = f"{h:02d}:{m:02d}:{s:02d}"
-                seek_to(control, time_str)
-                self.log(f"[SEEK] {time_str}")
+                self._seek_pos = new_pos
+                seek_str = format_duration(new_pos)
+                self.log(f"[SEEK] Restarting from {seek_str}...")
+                stop_playback(control)
+                time.sleep(1)
+                # Restart DongleCaster with new seek
+                self._dongle_caster.start(self._current_file, seek=seek_str, callback=self.log)
+                local = get_local_ip()
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                duration = self._dongle_caster.duration
+                ok, msg = cast_video(url, control, video_mime='video/MP2T', duration=duration)
+                if ok:
+                    self.log(f"[OK] Playing from {seek_str}")
+                else:
+                    self.log(f"[ERR] {msg}")
             except Exception as e:
                 self.log(f"[ERR] Seek failed: {e}")
         threading.Thread(target=run, daemon=True).start()
@@ -956,13 +1078,18 @@ class KeygenApp:
         def run():
             try:
                 stop_playback(self.discovered_device['control_url'])
-                self._kill_ffmpeg()
-                self.log("[OK] Playback stopped")
-                self.current_cast = None
-                self.now_playing.config(text="[NOW] Nothing", fg='#888888')
-                self.status_lbl.config(text="STOPPED", fg='#FFFF00')
-            except Exception as e:
-                self.log(f"[ERR] Stop failed: {e}")
+            except Exception:
+                pass
+            if hasattr(self, '_dongle_caster'):
+                self._dongle_caster.stop()
+            if self.http_server:
+                self.http_server.stop()
+                self.http_server = None
+            self.log("[OK] Playback stopped")
+            self.current_cast = None
+            self._current_file = None
+            self.now_playing.config(text="[NOW] Nothing", fg='#888888')
+            self.status_lbl.config(text="STOPPED", fg='#FFFF00')
         threading.Thread(target=run, daemon=True).start()
 
     def do_cast(self):
@@ -984,6 +1111,7 @@ class KeygenApp:
                 url = video
                 name = video.split('/')[-1][:40]
                 video_mime = 'video/mp4'
+                duration = None
             else:
                 if not os.path.exists(video):
                     self.log("[ERR] File not found!")
@@ -991,87 +1119,39 @@ class KeygenApp:
 
                 local = get_local_ip()
                 name = os.path.basename(video)
+                self._current_file = video
+                self._seek_pos = 0
 
-                # Check if transcoding needed
-                reason, reencode_video = needs_transcode(video)
-                if reason:
-                    self._kill_ffmpeg()
-                    tmp = os.path.join(tempfile.gettempdir(), 'casttotv_stream.mp4')
-                    self._ffmpeg_proc = start_transcode(video, tmp, reencode_video, self.log)
-                    # Wait for ffmpeg to finish (faststart needs complete file)
-                    self.log("[FFMPEG] Converting (video copy = fast)...")
-                    while self._ffmpeg_proc.poll() is None:
-                        time.sleep(1)
-                        if os.path.exists(tmp):
-                            sz = os.path.getsize(tmp) // 1024 // 1024
-                            self.log(f"[FFMPEG] {sz}MB...")
-                    if self._ffmpeg_proc.returncode != 0:
-                        self.log("[ERR] ffmpeg failed")
-                        return
-                    self.log(f"[FFMPEG] Done ({os.path.getsize(tmp) // 1024 // 1024}MB)")
+                # Always use DongleCaster (MPEG-TS stream) — works with all devices
+                if not hasattr(self, '_dongle_caster'):
+                    self._dongle_caster = DongleCaster(self.server_port + 2)
+                self._dongle_caster.start(video, callback=self.log)
 
-                    # Serve temp file via HTTP with Range support
-                    tmp_dir = os.path.dirname(tmp)
-                    if self.http_server:
-                        self.http_server.stop()
-                    self.http_server = HTTPServerThread(self.server_port, tmp_dir)
-                    self.http_server.subtitle_url = None
-                    try:
-                        self.http_server.start()
-                    except Exception as e:
-                        self.log(f"[WARN] HTTP: {e}")
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                video_mime = 'video/MP2T'
+                duration = self._dongle_caster.duration
 
-                    serve_name = os.path.basename(tmp)
-                    url = f"http://{local}:{self.server_port}/{quote(serve_name)}"
-                    video_mime = 'video/mp4'
-                else:
+                # Subtitles for LG TVs (CaptionInfo.sec) — start file server too
+                if subs and os.path.exists(subs):
                     video_dir = os.path.dirname(os.path.abspath(video))
-                    ext = os.path.splitext(video)[1].lower()
-                    video_mime = MIME_MAP.get(ext, 'video/mp4')
-
-                    # Resolve subtitle URL
-                    if subs and os.path.exists(subs):
-                        subs_dir = os.path.dirname(os.path.abspath(subs))
-                        sub_name = os.path.basename(subs)
-                        if subs_dir == video_dir:
-                            sub_url = f"http://{local}:{self.server_port}/{quote(sub_name)}"
-                        else:
-                            if not hasattr(self, 'sub_server') or self.sub_server is None or self.sub_server.directory != subs_dir:
-                                if hasattr(self, 'sub_server') and self.sub_server:
-                                    self.sub_server.stop()
-                                self.sub_server = HTTPServerThread(self.server_port + 1, subs_dir)
-                                try:
-                                    self.sub_server.start()
-                                    self.log(f"[HTTP] Subs server on port {self.server_port + 1}")
-                                except Exception as e:
-                                    self.log(f"[WARN] Subs HTTP: {e}")
-                            sub_url = f"http://{local}:{self.server_port + 1}/{quote(sub_name)}"
-                        self.log(f"[SUBS] {sub_name}")
-                    elif subs:
-                        self.log(f"[WARN] Subtitle file not found: {subs}")
-
-                    # Start/restart video HTTP server
-                    need_restart = (self.http_server is None or
-                                    self.http_server.directory != video_dir or
-                                    self.http_server.subtitle_url != sub_url)
-                    if need_restart:
+                    subs_dir = os.path.dirname(os.path.abspath(subs))
+                    sub_name = os.path.basename(subs)
+                    if not self.http_server or self.http_server.directory != subs_dir:
                         if self.http_server:
                             self.http_server.stop()
-                        self.http_server = HTTPServerThread(self.server_port, video_dir)
-                        self.http_server.subtitle_url = sub_url
+                        self.http_server = HTTPServerThread(self.server_port, subs_dir)
+                        self.http_server.subtitle_url = None
                         try:
                             self.http_server.start()
-                            self.log(f"[HTTP] Server on port {self.server_port}")
-                        except Exception as e:
-                            self.log(f"[WARN] HTTP: {e}")
-                    else:
-                        self.http_server.subtitle_url = sub_url
-
-                    url = f"http://{local}:{self.server_port}/{quote(name)}"
+                        except Exception:
+                            pass
+                    sub_url = f"http://{local}:{self.server_port}/{quote(sub_name)}"
+                    self.log(f"[SUBS] {sub_name}")
 
             self.log(f"[CAST] {self.discovered_device['friendly_name']}")
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
-            ok, msg = cast_video(url, control, subtitle_url=sub_url, video_mime=video_mime)
+            ok, msg = cast_video(url, control, subtitle_url=sub_url,
+                                 video_mime=video_mime, duration=duration)
             if ok:
                 self.log("[OK] Streaming started!")
                 if sub_url:
@@ -1086,14 +1166,10 @@ class KeygenApp:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _kill_ffmpeg(self):
-        if hasattr(self, '_ffmpeg_proc') and self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
-            self._ffmpeg_proc.kill()
-            self._ffmpeg_proc = None
-
     def on_close(self):
         self.music.stop()
-        self._kill_ffmpeg()
+        if hasattr(self, '_dongle_caster'):
+            self._dongle_caster.stop()
         if self.http_server:
             self.http_server.stop()
         if hasattr(self, 'sub_server') and self.sub_server:
