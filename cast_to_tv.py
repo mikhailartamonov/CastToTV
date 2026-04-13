@@ -385,30 +385,38 @@ def scan_network_for_tv(prefix, callback=None, cancel_check=None):
 # ---------- DLNA service scan for manual IP (fallback) ----------
 
 def find_dlna_service(tv_ip, callback=None, cancel_check=None):
-    """Try common LG DLNA ports first, then fall back to broader scan."""
-    # Common LG WebOS DLNA ports
-    priority_ports = [1780, 1782, 1790, 2700, 1800, 7000, 8008, 8060]
-    all_ports = priority_ports + [p for p in range(1000, 3000) if p not in priority_ports]
+    """Try common DLNA ports first (LG TV + WiFi dongles), then broader scan."""
+    # LG TV ports + EZCast/AnyCast/MiraScreen dongle ports
+    priority_ports = [49152, 49153, 49154, 2020, 7000, 8008, 8060,
+                      1780, 1782, 1790, 2700, 1800, 8080, 9000, 1900]
+    all_ports = priority_ports + [p for p in range(1000, 50000) if p not in priority_ports]
+
+    desc_paths = ['/', '/dmr/DeviceDescription.xml', '/xml/device_description.xml',
+                   '/upnp/dev/MediaRenderer/desc.xml', '/DeviceDescription.xml',
+                   '/rootDesc.xml', '/description.xml']
 
     for port in all_ports:
         if cancel_check and cancel_check():
             return None
-        if callback and port % 200 == 0:
+        if callback and port % 500 == 0 and port > priority_ports[-1]:
             callback(f"[SCAN] Port {port}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(0.05)
             if sock.connect_ex((tv_ip, port)) == 0:
                 sock.close()
-                try:
-                    url = f'http://{tv_ip}:{port}/'
-                    xml_raw = urllib.request.urlopen(url, timeout=2).read().decode('utf-8', errors='ignore')
-                    if 'MediaRenderer' in xml_raw or 'AVTransport' in xml_raw:
-                        device = _parse_device_description(url)
-                        if device:
-                            return device
-                except Exception:
-                    pass
+                for path in desc_paths:
+                    try:
+                        url = f'http://{tv_ip}:{port}{path}'
+                        xml_raw = urllib.request.urlopen(url, timeout=2).read().decode('utf-8', errors='ignore')
+                        if 'MediaRenderer' in xml_raw or 'AVTransport' in xml_raw:
+                            device = _parse_device_description(url)
+                            if device:
+                                if callback:
+                                    callback(f"[OK] Found on port {port}")
+                                return device
+                    except Exception:
+                        continue
             else:
                 sock.close()
         except Exception:
@@ -557,7 +565,7 @@ class KeygenApp:
 \u2551/_____//____/       /_____/\\____/    /_/      \\_/  (_)     \u2551
 \u2551                                                           \u2551
 \u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
-\u2551  [ LG WebOS DLNA Caster ]     v{VERSION}  *  D3x  *  2026  \u2551
+\u2551  [ DLNA Caster ]           v{VERSION}  *  D3x  *  2026  \u2551
 \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"""
 
         tk.Label(frame, text=banner, font=("Consolas", 7), fg='#00FF00', bg='#000000', justify='left').pack()
@@ -576,16 +584,25 @@ class KeygenApp:
             fg='#00FF00', bg='#001100', state='disabled')
         self.log_text.pack(padx=3, pady=3)
 
-        # Device info
-        dev_frame = tk.Frame(frame, bg='#000000')
-        dev_frame.pack(fill='x', padx=10, pady=3)
-        tk.Label(dev_frame, text="[TV]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
-        self.dev_label = tk.Label(dev_frame, text="Not discovered", font=("Consolas", 9),
-            fg='#888888', bg='#000000', anchor='w')
-        self.dev_label.pack(side='left', padx=5, fill='x', expand=True)
-        self.status_lbl = tk.Label(dev_frame, text="READY", font=("Consolas", 9, "bold"),
+        # Manual IP entry + device info
+        ip_frame = tk.Frame(frame, bg='#000000')
+        ip_frame.pack(fill='x', padx=10, pady=3)
+        tk.Label(ip_frame, text="[IP]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        self.ip_entry = tk.Entry(ip_frame, width=15, font=("Consolas", 9), fg='#00FF00', bg='#001100')
+        self.ip_entry.pack(side='left', padx=3)
+        tk.Button(ip_frame, text="CONNECT", font=("Consolas", 8, "bold"), fg='#000', bg='#FF9900',
+            command=self.do_manual_connect, bd=2).pack(side='left', padx=3)
+        self.status_lbl = tk.Label(ip_frame, text="READY", font=("Consolas", 9, "bold"),
             fg='#FFFF00', bg='#000000', width=14)
         self.status_lbl.pack(side='right')
+
+        # Device label
+        dev_frame = tk.Frame(frame, bg='#000000')
+        dev_frame.pack(fill='x', padx=10, pady=1)
+        tk.Label(dev_frame, text="[TV]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        self.dev_label = tk.Label(dev_frame, text="Not discovered — use DISCOVER or enter IP", font=("Consolas", 9),
+            fg='#888888', bg='#000000', anchor='w')
+        self.dev_label.pack(side='left', padx=5, fill='x', expand=True)
 
         # File
         file_frame = tk.Frame(frame, bg='#000000')
@@ -635,8 +652,8 @@ class KeygenApp:
             f"  HTTP Server built-in  *  Port {self.server_port}  *  All-in-one"),
             font=("Consolas", 8), fg='#006600', bg='#000000').pack(pady=3)
 
-        self.log(f"[SYS] D3x LG WebOS TV Caster v{VERSION} initialized")
-        self.log("[SYS] Click DISCOVER to find your TV via SSDP")
+        self.log(f"[SYS] D3x DLNA Caster v{VERSION} initialized")
+        self.log("[SYS] Click DISCOVER or enter IP and click CONNECT")
 
     def animate_matrix(self):
         self.matrix.update()
@@ -692,6 +709,23 @@ class KeygenApp:
         self.dev_label.config(text=f"{name} ({ip}:{port})", fg='#00FF00')
         self.status_lbl.config(text=f"PORT {port}", fg='#00FF00')
 
+    def do_manual_connect(self):
+        """Connect to a manually entered IP — scans for DLNA service."""
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            self.log("[ERR] Enter IP address first")
+            return
+        def run():
+            self.set_scanning(True)
+            self.log(f"[SCAN] Connecting to {ip}...")
+            device = find_dlna_service(ip, self.log, lambda: self.cancel_flag)
+            if device and not self.cancel_flag:
+                self._set_device(device)
+            elif not self.cancel_flag:
+                self.log(f"[ERR] No DLNA service found on {ip}")
+            self.set_scanning(False)
+        threading.Thread(target=run, daemon=True).start()
+
     def do_discover(self):
         """SSDP discovery — finds everything in one step."""
         def run():
@@ -701,13 +735,15 @@ class KeygenApp:
                                               cancel_check=lambda: self.cancel_flag)
             if devices and not self.cancel_flag:
                 self._set_device(devices[0])
+                self.ip_entry.delete(0, 'end')
+                self.ip_entry.insert(0, devices[0]['ip'])
                 self.log(f"[OK] Found {len(devices)} renderer(s)")
                 if len(devices) > 1:
                     for d in devices[1:]:
                         self.log(f"     + {d['friendly_name']} ({d['ip']}:{d['port']})")
             elif not self.cancel_flag:
                 self.log("[WARN] No DLNA renderers found via SSDP")
-                self.log("[TIP] Try NET SCAN as fallback")
+                self.log("[TIP] Enter IP manually and click CONNECT")
             self.set_scanning(False)
         threading.Thread(target=run, daemon=True).start()
 
