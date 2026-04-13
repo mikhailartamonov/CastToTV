@@ -629,6 +629,8 @@ class KeygenApp:
             command=self.do_discover, width=14, bd=3).pack(side='left', padx=5)
         tk.Button(btn1, text="< NET SCAN >", font=("Consolas", 10, "bold"), fg='#000', bg='#FFFF00',
             command=self.do_netscan, width=12, bd=3).pack(side='left', padx=5)
+        tk.Button(btn1, text="DONGLE WiFi", font=("Consolas", 9, "bold"), fg='#000', bg='#FF9900',
+            command=self.do_dongle_setup, width=11, bd=3).pack(side='left', padx=5)
 
         # Buttons row 2
         btn2 = tk.Frame(frame, bg='#000000')
@@ -708,6 +710,39 @@ class KeygenApp:
         port = device['port']
         self.dev_label.config(text=f"{name} ({ip}:{port})", fg='#00FF00')
         self.status_lbl.config(text=f"PORT {port}", fg='#00FF00')
+
+    def do_dongle_setup(self):
+        """Open WiFi dongle (Maxscreen/AnyCast/EZCast) web settings to reconfigure WiFi."""
+        import webbrowser
+        dongle_ips = ['192.168.49.1', '192.168.203.1', '192.168.1.1']
+        ip = self.ip_entry.get().strip()
+        if ip:
+            dongle_ips.insert(0, ip)
+
+        self.log("[DONGLE] Checking dongle web interface...")
+
+        def run():
+            for dip in dongle_ips:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    result = sock.connect_ex((dip, 80))
+                    sock.close()
+                    if result == 0:
+                        url = f'http://{dip}'
+                        self.log(f"[DONGLE] Found at {dip} — opening browser")
+                        self.log("[TIP] Click 'WIFI AP' > 'Scan' > select your home WiFi")
+                        self.log("[TIP] After dongle restarts, click DISCOVER")
+                        webbrowser.open(url)
+                        self.ip_entry.delete(0, 'end')
+                        self.ip_entry.insert(0, dip)
+                        return
+                except Exception:
+                    pass
+            self.log("[ERR] Dongle not found. Connect to dongle WiFi first!")
+            self.log("[TIP] Look for WiFi like 'Xhadapter-xxx' or 'AnyCast-xxx'")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def do_manual_connect(self):
         """Connect to a manually entered IP — scans for DLNA service."""
