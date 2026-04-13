@@ -21,6 +21,52 @@ import io
 import sys
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, urljoin, urlparse
+import subprocess
+import tempfile
+import json
+
+# ============= TRANSCODER =============
+
+def check_ffmpeg():
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+HAS_FFMPEG = check_ffmpeg()
+
+def needs_transcode(filepath):
+    """Check if file needs transcoding for dongle compatibility. Returns reason or None."""
+    if not HAS_FFMPEG:
+        return None
+    try:
+        result = subprocess.run([
+            'ffprobe', '-v', 'error', '-show_entries',
+            'stream=codec_name,codec_type', '-of', 'json', filepath
+        ], capture_output=True, text=True, timeout=10)
+        info = json.loads(result.stdout)
+        for stream in info.get('streams', []):
+            if stream.get('codec_type') == 'audio':
+                acodec = stream.get('codec_name', '')
+                if acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp'):
+                    return f'audio:{acodec}'
+    except Exception:
+        pass
+    return None
+
+def start_transcode(filepath, output_path, callback=None):
+    """Start ffmpeg transcoding: video copy + audio to AAC, fragmented MP4 for streaming."""
+    cmd = [
+        'ffmpeg', '-i', filepath,
+        '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
+        '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-y', output_path
+    ]
+    if callback:
+        callback(f"[FFMPEG] Transcoding audio to AAC...")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return proc
 
 # ============= 8-BIT KEYGEN MUSIC =============
 
@@ -496,6 +542,44 @@ def cast_video(video_url, control_url, subtitle_url=None, video_mime='video/mp4'
         return False, str(e)
 
 
+def get_position(control_url):
+    """Get current playback position. Returns (position_secs, duration_secs) or None."""
+    body = ('<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+            ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            '<s:Body><u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID>'
+            '</u:GetPositionInfo></s:Body></s:Envelope>')
+    req = urllib.request.Request(control_url, data=body.encode(), headers={
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo"'
+    })
+    resp = urllib.request.urlopen(req, timeout=5).read().decode()
+    def parse_time(tag):
+        m = re.search(rf'<{tag}>(\d+):(\d+):(\d+)', resp)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        return 0
+    return parse_time('RelTime'), parse_time('TrackDuration')
+
+
+def seek_to(control_url, time_str):
+    """Seek to absolute position (HH:MM:SS format)."""
+    body = ('<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+            ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            '<s:Body><u:Seek xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID>'
+            '<Unit>REL_TIME</Unit>'
+            f'<Target>{time_str}</Target>'
+            '</u:Seek></s:Body></s:Envelope>')
+    req = urllib.request.Request(control_url, data=body.encode(), headers={
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#Seek"'
+    })
+    urllib.request.urlopen(req, timeout=10)
+
+
 def stop_playback(control_url):
     stop_xml = ('<?xml version="1.0" encoding="utf-8"?>'
                 '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
@@ -652,6 +736,13 @@ class KeygenApp:
             command=self.do_cast, width=14, bd=3).pack(side='left', padx=5)
         tk.Button(btn2, text="< STOP >", font=("Consolas", 10, "bold"), fg='#000', bg='#AA0000',
             command=self.do_stop, width=10, bd=3).pack(side='left', padx=5)
+
+        # Seek buttons
+        seek_frame = tk.Frame(frame, bg='#000000')
+        seek_frame.pack(pady=3)
+        for label, sec in [("<<30s", -30), ("<<10s", -10), (">>10s", 10), (">>30s", 30), (">>5m", 300)]:
+            tk.Button(seek_frame, text=label, font=("Consolas", 8, "bold"), fg='#00FF00', bg='#003300',
+                command=lambda s=sec: self.do_seek(s), width=6, bd=2).pack(side='left', padx=2)
 
         # Now Playing label
         self.now_playing = tk.Label(frame, text="[NOW] Nothing", font=("Consolas", 8),
@@ -818,6 +909,25 @@ class KeygenApp:
             self.set_scanning(False)
         threading.Thread(target=run, daemon=True).start()
 
+    def do_seek(self, delta_secs):
+        """Seek relative to current position."""
+        if not self.discovered_device:
+            return
+        def run():
+            try:
+                control = self.discovered_device['control_url']
+                pos, dur = get_position(control)
+                new_pos = max(0, pos + delta_secs)
+                if dur > 0:
+                    new_pos = min(new_pos, dur - 1)
+                h, m, s = new_pos // 3600, (new_pos % 3600) // 60, new_pos % 60
+                time_str = f"{h:02d}:{m:02d}:{s:02d}"
+                seek_to(control, time_str)
+                self.log(f"[SEEK] {time_str}")
+            except Exception as e:
+                self.log(f"[ERR] Seek failed: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
     def do_stop(self):
         if not self.discovered_device:
             self.log("[ERR] No TV discovered — click DISCOVER first")
@@ -825,6 +935,7 @@ class KeygenApp:
         def run():
             try:
                 stop_playback(self.discovered_device['control_url'])
+                self._kill_ffmpeg()
                 self.log("[OK] Playback stopped")
                 self.current_cast = None
                 self.now_playing.config(text="[NOW] Nothing", fg='#888888')
@@ -856,9 +967,31 @@ class KeygenApp:
                 if not os.path.exists(video):
                     self.log("[ERR] File not found!")
                     return
-                video_dir = os.path.dirname(os.path.abspath(video))
+
+                cast_file = video
+                # Check if transcoding needed (AC3/DTS audio → AAC)
+                reason = needs_transcode(video)
+                if reason:
+                    self.log(f"[FFMPEG] Incompatible {reason}, transcoding...")
+                    tmp = os.path.join(tempfile.gettempdir(), 'casttotv_stream.mp4')
+                    # Kill previous transcode
+                    if hasattr(self, '_ffmpeg_proc') and self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
+                        self._ffmpeg_proc.kill()
+                    self._ffmpeg_proc = start_transcode(video, tmp, self.log)
+                    # Wait for initial data before casting
+                    for i in range(30):
+                        time.sleep(1)
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 1024 * 1024:
+                            break
+                        if self._ffmpeg_proc.poll() is not None:
+                            self.log("[ERR] ffmpeg exited unexpectedly")
+                            return
+                    cast_file = tmp
+                    self.log(f"[FFMPEG] Streaming ready ({os.path.getsize(tmp) // 1024 // 1024}MB buffered)")
+
+                video_dir = os.path.dirname(os.path.abspath(cast_file))
                 local = get_local_ip()
-                ext = os.path.splitext(video)[1].lower()
+                ext = os.path.splitext(cast_file)[1].lower()
                 video_mime = MIME_MAP.get(ext, 'video/mp4')
 
                 # Resolve subtitle URL
@@ -899,8 +1032,9 @@ class KeygenApp:
                 else:
                     self.http_server.subtitle_url = sub_url
 
+                serve_name = os.path.basename(cast_file)
                 name = os.path.basename(video)
-                url = f"http://{local}:{self.server_port}/{quote(name)}"
+                url = f"http://{local}:{self.server_port}/{quote(serve_name)}"
 
             self.log(f"[CAST] {self.discovered_device['friendly_name']}")
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
@@ -919,8 +1053,14 @@ class KeygenApp:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _kill_ffmpeg(self):
+        if hasattr(self, '_ffmpeg_proc') and self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
+            self._ffmpeg_proc.kill()
+            self._ffmpeg_proc = None
+
     def on_close(self):
         self.music.stop()
+        self._kill_ffmpeg()
         if self.http_server:
             self.http_server.stop()
         if hasattr(self, 'sub_server') and self.sub_server:
