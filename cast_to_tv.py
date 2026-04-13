@@ -35,126 +35,60 @@ def check_ffmpeg():
 
 HAS_FFMPEG = check_ffmpeg()
 
-def probe_codecs(filepath):
-    """Return dict with audio/video codec info."""
+import tempfile
+
+def probe_file(filepath):
+    """Return audio codec and total bitrate."""
     if not HAS_FFMPEG:
-        return {}
+        return '', 0
     try:
         result = subprocess.run([
-            'ffprobe', '-v', 'error', '-show_entries',
-            'stream=codec_name,codec_type', '-of', 'json', filepath
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'stream=codec_name,codec_type',
+            '-show_entries', 'format=bit_rate',
+            '-of', 'json', filepath
         ], capture_output=True, text=True, timeout=10)
         info = json.loads(result.stdout)
-        codecs = {}
-        for stream in info.get('streams', []):
-            ct = stream.get('codec_type', '')
-            codecs[ct] = stream.get('codec_name', '')
-        return codecs
+        acodec = ''
+        for s in info.get('streams', []):
+            if s.get('codec_type') == 'audio':
+                acodec = s.get('codec_name', '')
+        bitrate = int(info.get('format', {}).get('bit_rate', 0))
+        return acodec, bitrate
     except Exception:
-        return {}
+        return '', 0
 
 def needs_transcode(filepath):
-    """Check if file needs transcoding. Returns reason or None."""
-    codecs = probe_codecs(filepath)
-    acodec = codecs.get('audio', '')
-    if acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp'):
-        return f'audio:{acodec}'
-    return None
+    """Check if file needs transcoding. Returns (reason, needs_video_reencode)."""
+    acodec, bitrate = probe_file(filepath)
+    bad_audio = acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp')
+    high_bitrate = bitrate > 4_000_000  # >4 Mbit/s too much for WiFi dongles
+    if bad_audio and high_bitrate:
+        return f'audio:{acodec}+bitrate:{bitrate//1000}k', True
+    if bad_audio:
+        return f'audio:{acodec}', False
+    if high_bitrate:
+        return f'bitrate:{bitrate//1000}k', True
+    return None, False
 
-
-class TranscodeStream:
-    """ffmpeg → memory buffer → HTTP. Supports reconnects, no temp file."""
-
-    def __init__(self, port):
-        self.port = port
-        self.proc = None
-        self.server = None
-        self.buffer = bytearray()
-        self.lock = threading.Lock()
-        self.finished = False
-        self._reader_thread = None
-
-    def _reader(self):
-        """Read ffmpeg stdout into shared memory buffer."""
-        try:
-            while self.proc and self.proc.poll() is None:
-                chunk = self.proc.stdout.read(256 * 1024)
-                if not chunk:
-                    break
-                with self.lock:
-                    self.buffer.extend(chunk)
-        except Exception:
-            pass
-        self.finished = True
-
-    def start(self, filepath, callback=None):
-        self.stop()
-        self.buffer = bytearray()
-        self.finished = False
-        cmd = [
-            'ffmpeg', '-i', filepath,
-            '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
-            '-f', 'mpegts', 'pipe:1'
-        ]
+def start_transcode(filepath, output_path, reencode_video=False, callback=None):
+    """Start ffmpeg: fragmented MP4 to temp file. Returns Popen."""
+    if reencode_video:
+        vcmd = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'film',
+                '-b:v', '1500k', '-maxrate', '2000k', '-bufsize', '4000k',
+                '-vf', 'scale=-2:480']
         if callback:
-            callback("[FFMPEG] Streaming transcode (video copy + AAC)...")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
-        self._reader_thread.start()
+            callback("[FFMPEG] Transcoding video 480p@1.5M + audio AAC...")
+    else:
+        vcmd = ['-c:v', 'copy']
+        if callback:
+            callback("[FFMPEG] Remuxing video + transcoding audio AAC...")
 
-        stream = self  # reference for handler
-
-        class StreamHandler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.send_header('Content-Type', 'video/MP2T')
-                self.send_header('transferMode.dlna.org', 'Streaming')
-                self.send_header('Connection', 'close')
-                self.end_headers()
-                pos = 0
-                try:
-                    while True:
-                        with stream.lock:
-                            available = len(stream.buffer) - pos
-                        if available > 0:
-                            with stream.lock:
-                                chunk = bytes(stream.buffer[pos:pos + 256 * 1024])
-                            self.wfile.write(chunk)
-                            pos += len(chunk)
-                        elif stream.finished:
-                            break
-                        else:
-                            time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                    pass
-
-            def do_HEAD(self):
-                self.send_response(200)
-                self.send_header('Content-Type', 'video/MP2T')
-                self.send_header('transferMode.dlna.org', 'Streaming')
-                self.send_header('Accept-Ranges', 'none')
-                self.end_headers()
-
-            def log_message(self, format, *args):
-                pass
-
-        self.server = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), StreamHandler)
-        self.server.allow_reuse_address = True
-        self.server.daemon_threads = True
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
-            self.proc = None
-        if self.server:
-            try:
-                self.server.shutdown()
-            except Exception:
-                pass
-            self.server = None
-        self.buffer = bytearray()
-        self.finished = False
+    cmd = (['ffmpeg', '-i', filepath] + vcmd +
+           ['-c:a', 'aac', '-ac', '2', '-b:a', '128k',
+            '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            '-y', output_path])
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ============= 8-BIT KEYGEN MUSIC =============
 
@@ -1046,7 +980,6 @@ class KeygenApp:
 
         def run():
             sub_url = None
-            transcode = False
             if video.startswith("http"):
                 url = video
                 name = video.split('/')[-1][:40]
@@ -1057,23 +990,44 @@ class KeygenApp:
                     return
 
                 local = get_local_ip()
-                video_dir = os.path.dirname(os.path.abspath(video))
                 name = os.path.basename(video)
-                ext = os.path.splitext(video)[1].lower()
-                video_mime = MIME_MAP.get(ext, 'video/mp4')
 
                 # Check if transcoding needed
-                reason = needs_transcode(video)
+                reason, reencode_video = needs_transcode(video)
                 if reason:
-                    transcode = True
-                    self.log(f"[FFMPEG] {reason} — streaming transcode (no temp file)")
-                    if not hasattr(self, '_transcode_stream'):
-                        self._transcode_stream = TranscodeStream(self.server_port + 2)
-                    self._transcode_stream.start(video, self.log)
-                    time.sleep(1)  # Let ffmpeg start
-                    url = f"http://{local}:{self.server_port + 2}/stream.ts"
-                    video_mime = 'video/MP2T'
+                    self._kill_ffmpeg()
+                    tmp = os.path.join(tempfile.gettempdir(), 'casttotv_stream.mp4')
+                    self._ffmpeg_proc = start_transcode(video, tmp, reencode_video, self.log)
+                    # Wait for initial data
+                    self.log("[FFMPEG] Buffering...")
+                    for _ in range(60):
+                        time.sleep(0.5)
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 2 * 1024 * 1024:
+                            break
+                        if self._ffmpeg_proc.poll() is not None:
+                            self.log("[ERR] ffmpeg exited")
+                            return
+                    self.log(f"[FFMPEG] Ready ({os.path.getsize(tmp) // 1024 // 1024}MB)")
+
+                    # Serve temp file via HTTP with Range support
+                    tmp_dir = os.path.dirname(tmp)
+                    if self.http_server:
+                        self.http_server.stop()
+                    self.http_server = HTTPServerThread(self.server_port, tmp_dir)
+                    self.http_server.subtitle_url = None
+                    try:
+                        self.http_server.start()
+                    except Exception as e:
+                        self.log(f"[WARN] HTTP: {e}")
+
+                    serve_name = os.path.basename(tmp)
+                    url = f"http://{local}:{self.server_port}/{quote(serve_name)}"
+                    video_mime = 'video/mp4'
                 else:
+                    video_dir = os.path.dirname(os.path.abspath(video))
+                    ext = os.path.splitext(video)[1].lower()
+                    video_mime = MIME_MAP.get(ext, 'video/mp4')
+
                     # Resolve subtitle URL
                     if subs and os.path.exists(subs):
                         subs_dir = os.path.dirname(os.path.abspath(subs))
@@ -1119,8 +1073,6 @@ class KeygenApp:
             ok, msg = cast_video(url, control, subtitle_url=sub_url, video_mime=video_mime)
             if ok:
                 self.log("[OK] Streaming started!")
-                if transcode:
-                    self.log("[OK] Live transcode active")
                 if sub_url:
                     self.log("[OK] Subtitles attached")
                 self.status_lbl.config(text="PLAYING", fg='#00FF00')
@@ -1134,8 +1086,9 @@ class KeygenApp:
         threading.Thread(target=run, daemon=True).start()
 
     def _kill_ffmpeg(self):
-        if hasattr(self, '_transcode_stream'):
-            self._transcode_stream.stop()
+        if hasattr(self, '_ffmpeg_proc') and self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
+            self._ffmpeg_proc.kill()
+            self._ffmpeg_proc = None
 
     def on_close(self):
         self.music.stop()
