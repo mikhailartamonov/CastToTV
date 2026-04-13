@@ -84,6 +84,11 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.subtitle_url = subtitle_url
         super().__init__(*args, **kwargs)
 
+    def copyfile(self, source, outputfile):
+        """Override with larger buffer (256KB instead of 16KB) for video streaming."""
+        import shutil
+        shutil.copyfileobj(source, outputfile, length=256 * 1024)
+
     def translate_path(self, path):
         import posixpath
         path = posixpath.normpath(urllib.parse.unquote(path))
@@ -197,9 +202,10 @@ class _RangeFile:
     def close(self):
         self.f.close()
 
-class SilentTCPServer(socketserver.TCPServer):
-    """TCPServer that suppresses expected DLNA client disconnects."""
+class SilentThreadingTCPServer(socketserver.ThreadingTCPServer):
+    """ThreadingTCPServer: each request in its own thread. Suppresses DLNA disconnects."""
     allow_reuse_address = True
+    daemon_threads = True
 
     def handle_error(self, request, client_address):
         exc_type = sys.exc_info()[0]
@@ -222,7 +228,7 @@ class HTTPServerThread:
             return
         handler = lambda *args, **kwargs: RangeRequestHandler(
             *args, directory=self.directory, subtitle_url=self.subtitle_url, **kwargs)
-        self.server = SilentTCPServer(('0.0.0.0', self.port), handler)
+        self.server = SilentThreadingTCPServer(('0.0.0.0', self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.running = True
