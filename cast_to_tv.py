@@ -72,7 +72,7 @@ def needs_transcode(filepath):
     return None, False
 
 def start_transcode(filepath, output_path, reencode_video=False, callback=None):
-    """Start ffmpeg: fragmented MP4 to temp file. Returns Popen."""
+    """Start ffmpeg: normal MP4 with faststart. Returns Popen."""
     if reencode_video:
         vcmd = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'film',
                 '-b:v', '1500k', '-maxrate', '2000k', '-bufsize', '4000k',
@@ -86,7 +86,7 @@ def start_transcode(filepath, output_path, reencode_video=False, callback=None):
 
     cmd = (['ffmpeg', '-i', filepath] + vcmd +
            ['-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-            '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            '-movflags', '+faststart',
             '-y', output_path])
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -998,16 +998,17 @@ class KeygenApp:
                     self._kill_ffmpeg()
                     tmp = os.path.join(tempfile.gettempdir(), 'casttotv_stream.mp4')
                     self._ffmpeg_proc = start_transcode(video, tmp, reencode_video, self.log)
-                    # Wait for initial data
-                    self.log("[FFMPEG] Buffering...")
-                    for _ in range(60):
-                        time.sleep(0.5)
-                        if os.path.exists(tmp) and os.path.getsize(tmp) > 2 * 1024 * 1024:
-                            break
-                        if self._ffmpeg_proc.poll() is not None:
-                            self.log("[ERR] ffmpeg exited")
-                            return
-                    self.log(f"[FFMPEG] Ready ({os.path.getsize(tmp) // 1024 // 1024}MB)")
+                    # Wait for ffmpeg to finish (faststart needs complete file)
+                    self.log("[FFMPEG] Converting (video copy = fast)...")
+                    while self._ffmpeg_proc.poll() is None:
+                        time.sleep(1)
+                        if os.path.exists(tmp):
+                            sz = os.path.getsize(tmp) // 1024 // 1024
+                            self.log(f"[FFMPEG] {sz}MB...")
+                    if self._ffmpeg_proc.returncode != 0:
+                        self.log("[ERR] ffmpeg failed")
+                        return
+                    self.log(f"[FFMPEG] Done ({os.path.getsize(tmp) // 1024 // 1024}MB)")
 
                     # Serve temp file via HTTP with Range support
                     tmp_dir = os.path.dirname(tmp)
