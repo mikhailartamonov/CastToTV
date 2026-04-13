@@ -1,46 +1,48 @@
 #!/usr/bin/env python3
 """
-D3x LG WebOS TV CASTER v1.0 - DLNA Video Streaming Tool
+D3x LG WebOS TV CASTER v0.4.4-beta - DLNA Video Streaming Tool
 KeyGen 2005 Style Interface with MUSIC!
 """
+
+VERSION = "0.4.4-beta"
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import urllib.request
 import html
 import socket
+import struct
 import re
 import time
 import threading
 import random
 import os
-from urllib.parse import quote
+import io
+import sys
+import xml.etree.ElementTree as ET
+from urllib.parse import quote, urljoin, urlparse
 
 # ============= 8-BIT KEYGEN MUSIC =============
 
 try:
     import winsound
     HAS_SOUND = True
-except:
+except ImportError:
     HAS_SOUND = False
 
 class ChiptunePlayer:
     def __init__(self):
         self.playing = False
         self.thread = None
-        # Classic keygen style melody (Unreal Superhero / CORE vibe)
         self.melody = [
-            # Main theme
             (880, 100), (0, 20), (880, 100), (0, 20), (784, 100), (880, 150),
             (1047, 200), (0, 50), (784, 150), (0, 50),
             (659, 100), (0, 20), (659, 100), (0, 20), (587, 100), (659, 150),
             (784, 200), (0, 50), (523, 150), (0, 100),
-            # Variation
             (1047, 100), (988, 100), (880, 100), (784, 150), (0, 30),
             (880, 100), (784, 100), (659, 100), (587, 150), (0, 30),
             (659, 100), (587, 100), (523, 100), (494, 150), (0, 30),
             (523, 200), (0, 100),
-            # Arpeggios
             (523, 60), (659, 60), (784, 60), (1047, 60),
             (784, 60), (659, 60), (523, 60), (392, 60),
             (440, 60), (523, 60), (659, 60), (880, 60),
@@ -55,7 +57,7 @@ class ChiptunePlayer:
                 if freq > 0 and HAS_SOUND:
                     try:
                         winsound.Beep(freq, dur)
-                    except:
+                    except Exception:
                         time.sleep(dur / 1000)
                 else:
                     time.sleep(dur / 1000)
@@ -101,9 +103,8 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         ctype = self.guess_type(path)
         is_video = ctype.startswith('video/')
-        is_sub = os.path.splitext(path)[1].lower() in ('.srt','.sub','.smi','.vtt')
+        is_sub = os.path.splitext(path)[1].lower() in ('.srt', '.sub', '.smi', '.vtt')
 
-        # For subtitle files, serve with UTF-8 BOM prepended (LG WebOS requirement)
         if is_sub:
             return self._serve_subtitle(path, ctype)
 
@@ -161,32 +162,35 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Length', str(len(content)))
         self.send_header('transferMode.dlna.org', 'Interactive')
         self.end_headers()
-        import io
         return io.BytesIO(content)
 
     def _send_dlna_headers(self, is_video):
         if is_video:
             self.send_header('transferMode.dlna.org', 'Streaming')
-            self.send_header('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000')
+            self.send_header('contentFeatures.dlna.org',
+                             'DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000')
             if self.subtitle_url:
                 self.send_header('CaptionInfo.sec', self.subtitle_url)
 
     def guess_type(self, path):
         ext = os.path.splitext(path)[1].lower()
-        return {'.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
-                '.webm': 'video/webm', '.mov': 'video/quicktime',
-                '.srt': 'text/srt', '.sub': 'text/sub', '.smi': 'text/smi',
-                '.ass': 'text/ass', '.ssa': 'text/ssa', '.vtt': 'text/vtt'}.get(ext, 'application/octet-stream')
+        return {
+            '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
+            '.webm': 'video/webm', '.mov': 'video/quicktime',
+            '.srt': 'text/srt', '.sub': 'text/sub', '.smi': 'text/smi', '.vtt': 'text/vtt',
+        }.get(ext, 'application/octet-stream')
 
     def log_message(self, format, *args):
-        pass  # Suppress logging
+        pass
 
 class _RangeFile:
     def __init__(self, f, length):
         self.f, self.remaining = f, length
     def read(self, size=-1):
-        if self.remaining <= 0: return b''
-        if size < 0 or size > self.remaining: size = self.remaining
+        if self.remaining <= 0:
+            return b''
+        if size < 0 or size > self.remaining:
+            size = self.remaining
         data = self.f.read(size)
         self.remaining -= len(data)
         return data
@@ -198,7 +202,6 @@ class SilentTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
     def handle_error(self, request, client_address):
-        import sys
         exc_type = sys.exc_info()[0]
         if exc_type in (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             pass
@@ -217,17 +220,12 @@ class HTTPServerThread:
     def start(self):
         if self.running:
             return
-        handler = lambda *args, **kwargs: RangeRequestHandler(*args, directory=self.directory, subtitle_url=self.subtitle_url, **kwargs)
+        handler = lambda *args, **kwargs: RangeRequestHandler(
+            *args, directory=self.directory, subtitle_url=self.subtitle_url, **kwargs)
         self.server = SilentTCPServer(('0.0.0.0', self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.running = True
-
-    def restart_with_subs(self, subtitle_url):
-        self.subtitle_url = subtitle_url
-        if self.running:
-            self.stop()
-        self.start()
 
     def stop(self):
         if self.server:
@@ -236,46 +234,125 @@ class HTTPServerThread:
 
 # ============= DLNA FUNCTIONS =============
 
+MIME_MAP = {
+    '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
+    '.webm': 'video/webm', '.mov': 'video/quicktime',
+}
+
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-    except:
-        ip = '127.0.0.1'
+        return s.getsockname()[0]
+    except Exception:
+        return '127.0.0.1'
     finally:
         s.close()
-    return ip
 
 def get_network_prefix():
     ip = get_local_ip()
     return '.'.join(ip.split('.')[:3]) + '.'
 
-def discover_tv_ssdp(timeout=3):
+# ---------- SSDP Discovery (primary) ----------
+
+def discover_dlna_renderers(timeout=5, retries=3, callback=None, cancel_check=None):
+    """
+    Full SSDP discovery: M-SEARCH → parse LOCATION → fetch device XML → extract controlURL.
+    Returns list of dicts: {ip, port, friendly_name, control_url, control_path, location}
+    """
     SSDP_ADDR = '239.255.255.250'
     SSDP_PORT = 1900
     msg = ('M-SEARCH * HTTP/1.1\r\n'
            f'HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n'
            'MAN: "ssdp:discover"\r\n'
-           'MX: 3\r\n'
+           f'MX: {timeout}\r\n'
            'ST: urn:schemas-upnp-org:service:AVTransport:1\r\n\r\n')
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack("B", 4))
     sock.settimeout(timeout)
-    devices = []
+
+    if callback:
+        callback("[SSDP] Broadcasting M-SEARCH...")
+
+    locations = {}
     try:
-        sock.sendto(msg.encode(), (SSDP_ADDR, SSDP_PORT))
+        for _ in range(retries):
+            sock.sendto(msg.encode(), (SSDP_ADDR, SSDP_PORT))
+            time.sleep(0.1)
+
         end_time = time.time() + timeout
         while time.time() < end_time:
+            if cancel_check and cancel_check():
+                break
             try:
-                data, addr = sock.recvfrom(1024)
-                if addr[0] not in devices:
-                    devices.append(addr[0])
+                data, addr = sock.recvfrom(65507)
+                response = data.decode('utf-8', errors='ignore')
+                loc_match = re.search(r'\nlocation:\s*(.+)\r', response, re.IGNORECASE)
+                if loc_match:
+                    location = loc_match.group(1).strip()
+                    if location not in locations:
+                        locations[location] = addr[0]
+                        if callback:
+                            callback(f"[SSDP] Found device at {addr[0]}")
             except socket.timeout:
                 break
     finally:
         sock.close()
+
+    if callback:
+        callback(f"[SSDP] Got {len(locations)} response(s), parsing...")
+
+    devices = []
+    for location_url, ip in locations.items():
+        if cancel_check and cancel_check():
+            break
+        try:
+            device = _parse_device_description(location_url)
+            if device:
+                devices.append(device)
+                if callback:
+                    callback(f"[OK] {device['friendly_name']} ({device['ip']}:{device['port']})")
+        except Exception:
+            pass
+
     return devices
+
+
+def _parse_device_description(location_url):
+    """Fetch device description XML from LOCATION URL, extract friendlyName + AVTransport controlURL."""
+    xml_raw = urllib.request.urlopen(location_url, timeout=5).read().decode('utf-8', errors='ignore')
+    xml_clean = re.sub(r'\sxmlns="[^"]*"', '', xml_raw, count=1)
+    root = ET.fromstring(xml_clean)
+
+    device_el = root.find('./device')
+    if device_el is None:
+        return None
+
+    friendly_name = device_el.findtext('./friendlyName', 'Unknown')
+
+    control_path = None
+    for service in device_el.findall('.//service'):
+        stype = service.findtext('serviceType', '')
+        if 'AVTransport' in stype:
+            control_path = service.findtext('controlURL')
+            break
+
+    if not control_path:
+        return None
+
+    parsed = urlparse(location_url)
+    return {
+        'ip': parsed.hostname,
+        'port': parsed.port,
+        'friendly_name': friendly_name,
+        'control_url': urljoin(location_url, control_path),
+        'control_path': control_path,
+        'location': location_url,
+    }
+
+# ---------- Network scan (fallback) ----------
 
 def scan_network_for_tv(prefix, callback=None, cancel_check=None):
     devices = []
@@ -287,54 +364,60 @@ def scan_network_for_tv(prefix, callback=None, cancel_check=None):
             callback(f"[NET] Ping {ip}")
         try:
             found = False
-            for port in [1780, 1800, 8008, 8060, 9000]:
+            for port in [1780, 1782, 1790, 2700, 8008, 8060, 9000]:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(0.08)
                     if sock.connect_ex((ip, port)) == 0:
                         found = True
                     sock.close()
-                except:
+                except Exception:
                     pass
                 if found:
                     devices.append(ip)
                     if callback:
                         callback(f"[HIT] Device at {ip}")
                     break
-        except:
+        except Exception:
             pass
     return devices
 
+# ---------- DLNA service scan for manual IP (fallback) ----------
+
 def find_dlna_service(tv_ip, callback=None, cancel_check=None):
-    for port in range(1000, 3000):
+    """Try common LG DLNA ports first, then fall back to broader scan."""
+    # Common LG WebOS DLNA ports
+    priority_ports = [1780, 1782, 1790, 2700, 1800, 7000, 8008, 8060]
+    all_ports = priority_ports + [p for p in range(1000, 3000) if p not in priority_ports]
+
+    for port in all_ports:
         if cancel_check and cancel_check():
-            return None, None
+            return None
         if callback and port % 200 == 0:
-            callback(f"[SCAN] Port {port}/3000...")
+            callback(f"[SCAN] Port {port}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.03)
+            sock.settimeout(0.05)
             if sock.connect_ex((tv_ip, port)) == 0:
                 sock.close()
                 try:
                     url = f'http://{tv_ip}:{port}/'
-                    data = urllib.request.urlopen(url, timeout=1).read(1000).decode('utf-8', errors='ignore')
-                    if 'MediaRenderer' in data or 'AVTransport' in data:
-                        full = urllib.request.urlopen(url, timeout=3).read().decode()
-                        m = re.search(r'<controlURL>(/AVTransport/[^<]+)</controlURL>', full)
-                        if m:
-                            return port, m.group(1)
-                except:
+                    xml_raw = urllib.request.urlopen(url, timeout=2).read().decode('utf-8', errors='ignore')
+                    if 'MediaRenderer' in xml_raw or 'AVTransport' in xml_raw:
+                        device = _parse_device_description(url)
+                        if device:
+                            return device
+                except Exception:
                     pass
             else:
                 sock.close()
-        except:
+        except Exception:
             pass
-    return None, None
+    return None
 
-def cast_video(video_url, tv_ip, port, control_url, subtitle_url=None):
-    control = f'http://{tv_ip}:{port}{control_url}'
+# ---------- Cast / Stop ----------
 
+def cast_video(video_url, control_url, subtitle_url=None, video_mime='video/mp4'):
     sub_meta = ''
     if subtitle_url:
         sub_ext = os.path.splitext(subtitle_url.split('?')[0])[1].lstrip('.').lower()
@@ -342,17 +425,32 @@ def cast_video(video_url, tv_ip, port, control_url, subtitle_url=None):
         sub_meta = (f'<res protocolInfo="http-get:*:text/{sub_type}:*">{subtitle_url}</res>'
                     f'<sec:CaptionInfoEx sec:type="{sub_type}">{subtitle_url}</sec:CaptionInfoEx>')
 
-    didl = f'''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" xmlns:sec="http://www.sec.co.kr/"><item id="0" parentID="-1" restricted="1"><dc:title>Video</dc:title><upnp:class>object.item.videoItem.movie</upnp:class><res protocolInfo="http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000">{video_url}</res>{sub_meta}</item></DIDL-Lite>'''
+    didl = (f'<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
+            f' xmlns:dc="http://purl.org/dc/elements/1.1/"'
+            f' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"'
+            f' xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"'
+            f' xmlns:sec="http://www.sec.co.kr/">'
+            f'<item id="0" parentID="-1" restricted="1">'
+            f'<dc:title>Video</dc:title>'
+            f'<upnp:class>object.item.videoItem.movie</upnp:class>'
+            f'<res protocolInfo="http-get:*:{video_mime}:'
+            f'DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000">'
+            f'{video_url}</res>'
+            f'{sub_meta}'
+            f'</item></DIDL-Lite>')
 
-    set_uri = f'''<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body><u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-<InstanceID>0</InstanceID><CurrentURI>{video_url}</CurrentURI>
-<CurrentURIMetaData>{html.escape(didl)}</CurrentURIMetaData>
-</u:SetAVTransportURI></s:Body></s:Envelope>'''
+    set_uri = (f'<?xml version="1.0" encoding="utf-8"?>'
+               f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+               f' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+               f'<s:Body><u:SetAVTransportURI xmlns:u='
+               f'"urn:schemas-upnp-org:service:AVTransport:1">'
+               f'<InstanceID>0</InstanceID>'
+               f'<CurrentURI>{video_url}</CurrentURI>'
+               f'<CurrentURIMetaData>{html.escape(didl)}</CurrentURIMetaData>'
+               f'</u:SetAVTransportURI></s:Body></s:Envelope>')
 
     try:
-        req = urllib.request.Request(control, data=set_uri.encode(), headers={
+        req = urllib.request.Request(control_url, data=set_uri.encode(), headers={
             'Content-Type': 'text/xml; charset="utf-8"',
             'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI"'
         })
@@ -362,13 +460,15 @@ def cast_video(video_url, tv_ip, port, control_url, subtitle_url=None):
 
     time.sleep(1)
 
-    play = '''<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body><u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-<InstanceID>0</InstanceID><Speed>1</Speed></u:Play></s:Body></s:Envelope>'''
+    play = ('<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+            ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            '<s:Body><u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID><Speed>1</Speed>'
+            '</u:Play></s:Body></s:Envelope>')
 
     try:
-        req = urllib.request.Request(control, data=play.encode(), headers={
+        req = urllib.request.Request(control_url, data=play.encode(), headers={
             'Content-Type': 'text/xml; charset="utf-8"',
             'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#Play"'
         })
@@ -376,6 +476,20 @@ def cast_video(video_url, tv_ip, port, control_url, subtitle_url=None):
         return True, "OK"
     except Exception as e:
         return False, str(e)
+
+
+def stop_playback(control_url):
+    stop_xml = ('<?xml version="1.0" encoding="utf-8"?>'
+                '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+                ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                '<s:Body><u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                '<InstanceID>0</InstanceID>'
+                '</u:Stop></s:Body></s:Envelope>')
+    req = urllib.request.Request(control_url, data=stop_xml.encode(), headers={
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#Stop"'
+    })
+    urllib.request.urlopen(req, timeout=10)
 
 # ============= MATRIX RAIN =============
 
@@ -392,11 +506,13 @@ class MatrixRain:
         for i, d in enumerate(self.drops):
             x = i * 14 + 5
             c = random.choice(self.chars)
-            self.canvas.create_text(x, d*15, text=c, fill="#00FF00", font=("Consolas", 10, "bold"), tags="m")
+            self.canvas.create_text(x, d * 15, text=c, fill="#00FF00",
+                                    font=("Consolas", 10, "bold"), tags="m")
             for j in range(1, 5):
                 if d - j > 0:
-                    self.canvas.create_text(x, (d-j)*15, text=random.choice(self.chars),
-                        fill=f"#{0:02x}{max(0,180-j*40):02x}{0:02x}", font=("Consolas", 10), tags="m")
+                    g = max(0, 180 - j * 40)
+                    self.canvas.create_text(x, (d - j) * 15, text=random.choice(self.chars),
+                                            fill=f"#00{g:02x}00", font=("Consolas", 10), tags="m")
             self.drops[i] += 1
             if self.drops[i] * 15 > self.h + 60:
                 self.drops[i] = random.randint(-8, 0)
@@ -406,78 +522,69 @@ class MatrixRain:
 class KeygenApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("D3x LG Caster")
-        self.root.geometry("720x600")
+        self.root.title(f"D3x LG Caster v{VERSION}")
+        self.root.geometry("720x620")
         self.root.resizable(False, False)
         self.root.configure(bg='#000000')
 
-        self.tv_ip = None
-        self.dlna_port = None
-        self.control_url = None
+        self.discovered_device = None  # {ip, port, friendly_name, control_url, ...}
         self.server_port = 8766
         self.cancel_flag = False
         self.scanning = False
 
         self.music = ChiptunePlayer()
         self.music_on = False
-        self.current_cast = None  # Currently casting file
-        self.http_server = None  # Built-in HTTP server
+        self.current_cast = None
+        self.http_server = None
 
         self.build_ui()
-        self.matrix = MatrixRain(self.matrix_canvas, 720, 600)
+        self.matrix = MatrixRain(self.matrix_canvas, 720, 620)
         self.animate_matrix()
-        # Music OFF by default
 
     def build_ui(self):
-        self.matrix_canvas = tk.Canvas(self.root, width=720, height=600, bg='#000000', highlightthickness=0)
+        self.matrix_canvas = tk.Canvas(self.root, width=720, height=620, bg='#000000', highlightthickness=0)
         self.matrix_canvas.place(x=0, y=0)
 
         frame = tk.Frame(self.root, bg='#000000')
         frame.place(relx=0.5, rely=0.5, anchor='center')
 
-        banner = """
-╔═══════════════════════════════════════════════════════════╗
-║    ____  _____         __    ______   ______          __  ║
-║   / __ \\|__  /_ __    / /   / ____/  /_  __/__  __   / /  ║
-║  / / / / /_ <\\ \\ /   / /   / / __     / /  \\ \\ / /  / /   ║
-║ / /_/ /___/ / /_/   / /___/ /_/ /    / /    \\ V /  /_/    ║
-║/_____//____/       /_____/\\____/    /_/      \\_/  (_)     ║
-║                                                           ║
-╠═══════════════════════════════════════════════════════════╣
-║  [ LG WebOS DLNA Caster ]     Coded by D3x  *  2026       ║
-╚═══════════════════════════════════════════════════════════╝"""
+        banner = f"""
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551    ____  _____         __    ______   ______          __  \u2551
+\u2551   / __ \\|__  /_ __    / /   / ____/  /_  __/__  __   / /  \u2551
+\u2551  / / / / /_ <\\ \\ /   / /   / / __     / /  \\ \\ / /  / /   \u2551
+\u2551 / /_/ /___/ / /_/   / /___/ /_/ /    / /    \\ V /  /_/    \u2551
+\u2551/_____//____/       /_____/\\____/    /_/      \\_/  (_)     \u2551
+\u2551                                                           \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551  [ LG WebOS DLNA Caster ]     v{VERSION}  *  D3x  *  2026  \u2551
+\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"""
 
         tk.Label(frame, text=banner, font=("Consolas", 7), fg='#00FF00', bg='#000000', justify='left').pack()
 
         # Music toggle
         top_row = tk.Frame(frame, bg='#000000')
         top_row.pack(fill='x', padx=10)
-        self.music_btn = tk.Button(top_row, text="♫ MUSIC OFF", font=("Consolas", 8, "bold"),
+        self.music_btn = tk.Button(top_row, text="\u266b MUSIC OFF", font=("Consolas", 8, "bold"),
             fg='#000000', bg='#555555', command=self.toggle_music, width=12, bd=2)
         self.music_btn.pack(side='right')
 
         # Log
         log_frame = tk.Frame(frame, bg='#001100', relief='sunken', bd=2)
         log_frame.pack(fill='x', padx=10, pady=5)
-        self.log_text = tk.Text(log_frame, height=5, width=78, font=("Consolas", 9),
+        self.log_text = tk.Text(log_frame, height=6, width=78, font=("Consolas", 9),
             fg='#00FF00', bg='#001100', state='disabled')
         self.log_text.pack(padx=3, pady=3)
 
-        # IP / Port manual entry
-        ip_frame = tk.Frame(frame, bg='#000000')
-        ip_frame.pack(fill='x', padx=10, pady=5)
-
-        tk.Label(ip_frame, text="[TV IP]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
-        self.ip_entry = tk.Entry(ip_frame, width=15, font=("Consolas", 9), fg='#00FF00', bg='#001100')
-        self.ip_entry.pack(side='left', padx=5)
-        self.ip_entry.insert(0, "192.168.100.28")
-
-        tk.Label(ip_frame, text="[PORT]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left', padx=(15,0))
-        self.port_entry = tk.Entry(ip_frame, width=6, font=("Consolas", 9), fg='#00FF00', bg='#001100')
-        self.port_entry.pack(side='left', padx=5)
-        self.port_entry.insert(0, "auto")
-
-        self.status_lbl = tk.Label(ip_frame, text="READY", font=("Consolas", 9, "bold"), fg='#FFFF00', bg='#000000', width=14)
+        # Device info
+        dev_frame = tk.Frame(frame, bg='#000000')
+        dev_frame.pack(fill='x', padx=10, pady=3)
+        tk.Label(dev_frame, text="[TV]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        self.dev_label = tk.Label(dev_frame, text="Not discovered", font=("Consolas", 9),
+            fg='#888888', bg='#000000', anchor='w')
+        self.dev_label.pack(side='left', padx=5, fill='x', expand=True)
+        self.status_lbl = tk.Label(dev_frame, text="READY", font=("Consolas", 9, "bold"),
+            fg='#FFFF00', bg='#000000', width=14)
         self.status_lbl.pack(side='right')
 
         # File
@@ -501,12 +608,10 @@ class KeygenApp:
         # Buttons row 1
         btn1 = tk.Frame(frame, bg='#000000')
         btn1.pack(pady=8)
-        tk.Button(btn1, text="< SSDP >", font=("Consolas", 10, "bold"), fg='#000', bg='#00FFFF',
-            command=self.do_ssdp, width=12, bd=3).pack(side='left', padx=5)
+        tk.Button(btn1, text="< DISCOVER >", font=("Consolas", 10, "bold"), fg='#000', bg='#00FFFF',
+            command=self.do_discover, width=14, bd=3).pack(side='left', padx=5)
         tk.Button(btn1, text="< NET SCAN >", font=("Consolas", 10, "bold"), fg='#000', bg='#FFFF00',
             command=self.do_netscan, width=12, bd=3).pack(side='left', padx=5)
-        tk.Button(btn1, text="< FIND DLNA >", font=("Consolas", 10, "bold"), fg='#000', bg='#00FF00',
-            command=self.do_dlna_scan, width=12, bd=3).pack(side='left', padx=5)
 
         # Buttons row 2
         btn2 = tk.Frame(frame, bg='#000000')
@@ -525,13 +630,13 @@ class KeygenApp:
         self.now_playing.pack(fill='x', padx=10, pady=2)
 
         # Footer
-        tk.Label(frame, text="═══════════════════════════════════════════════════════════════════\n" +
+        tk.Label(frame, text=("\u2550" * 67 + "\n" +
             "  Greets: Scene 2005 | #warez | The good old days\n" +
-            "  HTTP Server built-in  *  Port 8766  *  All-in-one",
+            f"  HTTP Server built-in  *  Port {self.server_port}  *  All-in-one"),
             font=("Consolas", 8), fg='#006600', bg='#000000').pack(pady=3)
 
-        self.log("[SYS] D3x LG WebOS TV Caster v1.0 initialized")
-        self.log("[SYS] Enter TV IP or use SSDP/NET SCAN to find it")
+        self.log(f"[SYS] D3x LG WebOS TV Caster v{VERSION} initialized")
+        self.log("[SYS] Click DISCOVER to find your TV via SSDP")
 
     def animate_matrix(self):
         self.matrix.update()
@@ -549,11 +654,11 @@ class KeygenApp:
         if self.music_on:
             self.music.stop()
             self.music_on = False
-            self.music_btn.config(text="♫ MUSIC OFF", bg='#555555')
+            self.music_btn.config(text="\u266b MUSIC OFF", bg='#555555')
         else:
             self.music.start()
             self.music_on = True
-            self.music_btn.config(text="♫ MUSIC ON", bg='#FF00FF')
+            self.music_btn.config(text="\u266b MUSIC ON", bg='#FF00FF')
 
     def browse(self):
         f = filedialog.askopenfilename(filetypes=[("Video", "*.mp4 *.mkv *.avi *.webm *.mov"), ("All", "*.*")])
@@ -562,7 +667,7 @@ class KeygenApp:
             self.file_entry.insert(0, f)
 
     def browse_subs(self):
-        f = filedialog.askopenfilename(filetypes=[("Subtitles", "*.srt *.sub *.smi *.ass *.ssa *.vtt"), ("All", "*.*")])
+        f = filedialog.askopenfilename(filetypes=[("Subtitles", "*.srt *.sub *.smi *.vtt"), ("All", "*.*")])
         if f:
             self.sub_entry.delete(0, 'end')
             self.sub_entry.insert(0, f)
@@ -571,148 +676,117 @@ class KeygenApp:
         self.scanning = state
         self.cancel_flag = False
         self.cancel_btn.config(state='normal' if state else 'disabled')
-        self.status_lbl.config(text="SCANNING..." if state else "READY", fg='#FF6600' if state else '#FFFF00')
+        self.status_lbl.config(text="SCANNING..." if state else "READY",
+                               fg='#FF6600' if state else '#FFFF00')
 
     def cancel(self):
         self.cancel_flag = True
         self.log("[!] Cancelled by user")
 
-    def do_ssdp(self):
+    def _set_device(self, device):
+        """Set discovered device and update UI."""
+        self.discovered_device = device
+        name = device['friendly_name']
+        ip = device['ip']
+        port = device['port']
+        self.dev_label.config(text=f"{name} ({ip}:{port})", fg='#00FF00')
+        self.status_lbl.config(text=f"PORT {port}", fg='#00FF00')
+
+    def do_discover(self):
+        """SSDP discovery — finds everything in one step."""
         def run():
             self.set_scanning(True)
-            self.log("[SSDP] Broadcasting...")
-            devs = discover_tv_ssdp(3)
-            if devs:
-                self.ip_entry.delete(0, 'end')
-                self.ip_entry.insert(0, devs[0])
-                self.log(f"[OK] Found: {', '.join(devs)}")
-            else:
-                self.log("[WARN] No devices via SSDP")
+            devices = discover_dlna_renderers(timeout=5, retries=3,
+                                              callback=self.log,
+                                              cancel_check=lambda: self.cancel_flag)
+            if devices and not self.cancel_flag:
+                self._set_device(devices[0])
+                self.log(f"[OK] Found {len(devices)} renderer(s)")
+                if len(devices) > 1:
+                    for d in devices[1:]:
+                        self.log(f"     + {d['friendly_name']} ({d['ip']}:{d['port']})")
+            elif not self.cancel_flag:
+                self.log("[WARN] No DLNA renderers found via SSDP")
+                self.log("[TIP] Try NET SCAN as fallback")
             self.set_scanning(False)
         threading.Thread(target=run, daemon=True).start()
 
     def do_netscan(self):
+        """Network scan fallback — finds IPs, then fetches device descriptions."""
         def run():
             self.set_scanning(True)
             prefix = get_network_prefix()
             self.log(f"[NET] Scanning {prefix}0/24...")
             devs = scan_network_for_tv(prefix, self.log, lambda: self.cancel_flag)
             if devs and not self.cancel_flag:
-                self.ip_entry.delete(0, 'end')
-                self.ip_entry.insert(0, devs[0])
-                self.log(f"[OK] Found {len(devs)} device(s)")
+                self.log(f"[NET] Found {len(devs)} device(s), checking DLNA...")
+                for ip in devs:
+                    if self.cancel_flag:
+                        break
+                    self.log(f"[SCAN] Checking {ip}...")
+                    device = find_dlna_service(ip, self.log, lambda: self.cancel_flag)
+                    if device:
+                        self._set_device(device)
+                        self.log(f"[OK] {device['friendly_name']} ({ip}:{device['port']})")
+                        break
+                else:
+                    if not self.cancel_flag:
+                        self.log("[ERR] No DLNA service found on discovered devices")
             elif not self.cancel_flag:
-                self.log("[WARN] No devices found")
-            self.set_scanning(False)
-        threading.Thread(target=run, daemon=True).start()
-
-    def do_dlna_scan(self):
-        def run():
-            self.set_scanning(True)
-            ip = self.ip_entry.get().strip()
-            if not ip:
-                self.log("[ERR] Enter TV IP first!")
-                self.set_scanning(False)
-                return
-            self.log(f"[SCAN] Scanning {ip} ports 1000-3000...")
-            port, ctrl = find_dlna_service(ip, self.log, lambda: self.cancel_flag)
-            if port and not self.cancel_flag:
-                self.dlna_port = port
-                self.control_url = ctrl
-                self.tv_ip = ip
-                self.port_entry.delete(0, 'end')
-                self.port_entry.insert(0, str(port))
-                self.log(f"[OK] DLNA on port {port}")
-                self.status_lbl.config(text=f"PORT {port}", fg='#00FF00')
-            elif not self.cancel_flag:
-                self.log("[ERR] DLNA not found!")
-                self.status_lbl.config(text="NOT FOUND", fg='#FF0000')
+                self.log("[WARN] No devices found on network")
             self.set_scanning(False)
         threading.Thread(target=run, daemon=True).start()
 
     def do_stop(self):
-        """Stop current playback on TV"""
-        ip = self.ip_entry.get().strip()
-        port_s = self.port_entry.get().strip()
-
-        if not ip:
-            self.log("[ERR] No TV IP")
+        if not self.discovered_device:
+            self.log("[ERR] No TV discovered — click DISCOVER first")
             return
-
-        if port_s == "auto" or not port_s:
-            if not self.dlna_port:
-                self.log("[ERR] No DLNA port")
-                return
-            port = self.dlna_port
-            ctrl = self.control_url
-        else:
-            port = int(port_s)
-            ctrl = "/AVTransport/88c02eda-1570-6616-a5df-d1730b811149/control.xml"
-
         def run():
-            control = f'http://{ip}:{port}{ctrl}'
-            stop_xml = '''<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body><u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-<InstanceID>0</InstanceID></u:Stop></s:Body></s:Envelope>'''
             try:
-                req = urllib.request.Request(control, data=stop_xml.encode(), headers={
-                    'Content-Type': 'text/xml; charset="utf-8"',
-                    'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#Stop"'
-                })
-                urllib.request.urlopen(req, timeout=10)
+                stop_playback(self.discovered_device['control_url'])
                 self.log("[OK] Playback stopped")
                 self.current_cast = None
                 self.now_playing.config(text="[NOW] Nothing", fg='#888888')
                 self.status_lbl.config(text="STOPPED", fg='#FFFF00')
             except Exception as e:
                 self.log(f"[ERR] Stop failed: {e}")
-
         threading.Thread(target=run, daemon=True).start()
 
     def do_cast(self):
-        ip = self.ip_entry.get().strip()
-        port_s = self.port_entry.get().strip()
         video = self.file_entry.get().strip()
         subs = self.sub_entry.get().strip()
 
-        if not ip:
-            messagebox.showerror("Error", "Enter TV IP!")
+        if not self.discovered_device:
+            messagebox.showerror("Error", "Click DISCOVER first!")
             return
         if not video:
             messagebox.showerror("Error", "Select video file!")
             return
 
-        if port_s == "auto" or not port_s:
-            if not self.dlna_port:
-                messagebox.showerror("Error", "Click FIND DLNA first!")
-                return
-            port = self.dlna_port
-            ctrl = self.control_url
-        else:
-            port = int(port_s)
-            ctrl = "/AVTransport/88c02eda-1570-6616-a5df-d1730b811149/control.xml"
+        control = self.discovered_device['control_url']
 
         def run():
             sub_url = None
             if video.startswith("http"):
                 url = video
                 name = video.split('/')[-1][:40]
+                video_mime = 'video/mp4'
             else:
                 if not os.path.exists(video):
-                    self.log(f"[ERR] File not found!")
+                    self.log("[ERR] File not found!")
                     return
                 video_dir = os.path.dirname(os.path.abspath(video))
                 local = get_local_ip()
+                ext = os.path.splitext(video)[1].lower()
+                video_mime = MIME_MAP.get(ext, 'video/mp4')
 
-                # Resolve subtitle URL first (needed before starting video server)
+                # Resolve subtitle URL
                 if subs and os.path.exists(subs):
                     subs_dir = os.path.dirname(os.path.abspath(subs))
                     sub_name = os.path.basename(subs)
                     if subs_dir == video_dir:
                         sub_url = f"http://{local}:{self.server_port}/{quote(sub_name)}"
                     else:
-                        # Subs in different dir — start separate server
                         if not hasattr(self, 'sub_server') or self.sub_server is None or self.sub_server.directory != subs_dir:
                             if hasattr(self, 'sub_server') and self.sub_server:
                                 self.sub_server.stop()
@@ -727,7 +801,7 @@ class KeygenApp:
                 elif subs:
                     self.log(f"[WARN] Subtitle file not found: {subs}")
 
-                # Start/restart video HTTP server with subtitle URL for CaptionInfo.sec header
+                # Start/restart video HTTP server
                 need_restart = (self.http_server is None or
                                 self.http_server.directory != video_dir or
                                 self.http_server.subtitle_url != sub_url)
@@ -747,9 +821,9 @@ class KeygenApp:
                 name = os.path.basename(video)
                 url = f"http://{local}:{self.server_port}/{quote(name)}"
 
-            self.log(f"[CAST] {ip}:{port}")
+            self.log(f"[CAST] {self.discovered_device['friendly_name']}")
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
-            ok, msg = cast_video(url, ip, port, ctrl, subtitle_url=sub_url)
+            ok, msg = cast_video(url, control, subtitle_url=sub_url, video_mime=video_mime)
             if ok:
                 self.log("[OK] Streaming started!")
                 if sub_url:
