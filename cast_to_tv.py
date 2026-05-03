@@ -5,6 +5,21 @@ KeyGen 2005 Style Interface with MUSIC!
 """
 
 VERSION = "0.4.4-beta"
+DEBUG_VERBOSE = True  # set False to silence file-log lines
+
+# Module-level file logger so non-GUI helpers (HTTP handler, SOAP) can log
+# without needing the Tk callback. Path resolves next to the script.
+_LOG_PATH = None  # set after `os` import below
+
+def _file_log(msg):
+    if not _LOG_PATH or not DEBUG_VERBOSE:
+        return
+    try:
+        import time as _t
+        with open(_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"{_t.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -23,6 +38,8 @@ import xml.etree.ElementTree as ET
 from urllib.parse import quote, urljoin, urlparse
 import subprocess
 import json
+
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cast_log.txt')
 
 # ============= TRANSCODER =============
 
@@ -276,8 +293,11 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         return path
 
     def send_head(self):
+        range_header = self.headers.get('Range', '-')
+        _file_log(f"[HTTP] req {self.command} {self.path} from {self.client_address[0]} Range={range_header} UA={self.headers.get('User-Agent','-')}")
         path = self.translate_path(self.path)
         if os.path.isdir(path):
+            _file_log(f"[HTTP] resp dir-index for {path}")
             return super().send_head()
 
         ctype = self.guess_type(path)
@@ -285,24 +305,26 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         is_sub = os.path.splitext(path)[1].lower() in ('.srt', '.sub', '.smi', '.vtt')
 
         if is_sub:
+            _file_log(f"[HTTP] resp subtitle {path}")
             return self._serve_subtitle(path, ctype)
 
         try:
             f = open(path, 'rb')
-        except OSError:
+        except OSError as e:
+            _file_log(f"[HTTP] resp 404 — open fail {path}: {e}")
             self.send_error(404, "File not found")
             return None
 
         fs = os.fstat(f.fileno())
         file_size = fs.st_size
 
-        range_header = self.headers.get('Range')
-        if range_header:
+        if range_header and range_header != '-':
             match = re.match(r'bytes=(\d*)-(\d*)', range_header)
             if match:
                 start = int(match.group(1)) if match.group(1) else 0
                 end = int(match.group(2)) if match.group(2) else file_size - 1
                 if start >= file_size:
+                    _file_log(f"[HTTP] resp 416 (start={start} >= size={file_size})")
                     f.close()
                     self.send_error(416, 'Range Not Satisfiable')
                     return None
@@ -315,6 +337,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Accept-Ranges', 'bytes')
                 self._send_dlna_headers(is_video)
                 self.end_headers()
+                _file_log(f"[HTTP] resp 206 bytes {start}-{end}/{file_size} ctype={ctype}")
                 f.seek(start)
                 return _RangeFile(f, length)
 
@@ -324,6 +347,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Accept-Ranges', 'bytes')
         self._send_dlna_headers(is_video)
         self.end_headers()
+        _file_log(f"[HTTP] resp 200 size={file_size} ctype={ctype}")
         return f
 
     def _serve_subtitle(self, path, ctype):
@@ -350,6 +374,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                              'DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000')
             if self.subtitle_url:
                 self.send_header('CaptionInfo.sec', self.subtitle_url)
+            _file_log(f"[HTTP] dlna headers: Streaming, OP=01 FLAGS=01700000..., CaptionInfo.sec={self.subtitle_url}")
 
     def guess_type(self, path):
         ext = os.path.splitext(path)[1].lower()
@@ -362,7 +387,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         }.get(ext, 'application/octet-stream')
 
     def log_message(self, format, *args):
-        pass
+        _file_log(f"[HTTP-access] {self.address_string()} {format % args}")
 
 class _RangeFile:
     def __init__(self, f, length):
