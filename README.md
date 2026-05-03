@@ -25,6 +25,15 @@
 
 ![SSDP discovery — real LG webOS TV detected](docs/images/devices.png)
 
+## Screenshots
+
+| | |
+|---|---|
+| Initial state — banner, log box, IP entry | Live SSDP — real LG webOS UP7750 detected |
+| ![Main](docs/images/main.png) | ![Devices](docs/images/devices.png) |
+| Dongle WiFi setup probe (no dongle on this LAN) | Connecting + casting a 4K mp4 to the TV |
+| ![Dongle](docs/images/dongle.png) | ![Cast](docs/images/cast.png) |
+
 ---
 
 ## TL;DR
