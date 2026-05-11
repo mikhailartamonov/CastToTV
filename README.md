@@ -9,18 +9,19 @@
 ║/_____//____/       /_____/\____/    /_/      \_/  (_)     ║
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
-║  [ DLNA Caster ]           v0.4.4-beta  *  D3x  *  2026  ║
+║  [ DLNA Caster ]           v0.5.0-beta  *  D3x  *  2026  ║
 ╚═══════════════════════════════════════════════════════════╝
 ```
 
 > A keygen-2005-styled DLNA caster for LG webOS TVs and generic WiFi
-> cast dongles, with on-the-fly transcoding and external subtitles.
-> Single-file Python, ~1200 LOC, no installation.
+> cast dongles. Fast parallel SSDP+/24 discovery with deep port-scan
+> fallback, on-the-fly AC3/DTS→AAC transcoding, external subtitles,
+> pause/resume, single-file Python, ~1500 LOC, no installation.
 
 [![python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![status](https://img.shields.io/badge/status-v0.4.4--beta-orange)]()
+[![status](https://img.shields.io/badge/status-v0.5.0--beta-orange)]()
 [![receivers](https://img.shields.io/badge/receivers-LG%20webOS%20%7C%20AnyCast%20%7C%20EZCast%20%7C%20Maxscreen%20%7C%20ElfCast-blueviolet)]()
 
 ![SSDP discovery — real LG webOS TV detected](docs/images/devices.png)
@@ -29,9 +30,9 @@
 
 | | |
 |---|---|
-| Initial state — banner, log box, IP entry | Live SSDP — real LG webOS UP7750 detected |
+| Initial state — `[TV]` dropdown, `[MODE]` checkbox, PAUSE button | Fast discovery — LG webOS UP7750 detected, IP synced, dropdown populated |
 | ![Main](docs/images/main.png) | ![Devices](docs/images/devices.png) |
-| Dongle WiFi setup probe (no dongle on this LAN) | Connecting + casting a 4K mp4 to the TV |
+| `DONGLE WiFi` probe (mid-check of dongle gateway IPs) | Mid-cast — selftest HEAD/GET, `SetAVTransportURI 200`, `Play 200`, "Streaming started!" |
 | ![Dongle](docs/images/dongle.png) | ![Cast](docs/images/cast.png) |
 
 ---
@@ -54,16 +55,22 @@ needs a server. Kodi wants a remote. Web casts re-encode the entire
 file. Chrome's Cast extension only speaks Google's protocol.
 
 DLNA / UPnP works on every TV in the last 15 years, but the spec is a
-maze and LG's implementation has three quirks no one writes down:
+maze and LG's implementation has five quirks no one writes down:
 
 1. **The AVTransport port randomises after every reboot** — port `9197`
    one day, `41123` the next. So discovery has to happen every session.
-2. **External subtitles need `CaptionInfo.sec` _plus_ `sec:CaptionInfoEx`**
+2. **SSDP multicast is silently dropped on many home LANs** (AP isolation,
+   IGMP snooping, guest VLAN, mesh APs) — the TV is there, just unreachable
+   via the polite discovery path. Most casters give up here.
+3. **External subtitles need `CaptionInfo.sec` _plus_ `sec:CaptionInfoEx`**
    — both, in matching case, or the renderer ignores them.
-3. **Subtitles must start with a UTF-8 BOM**, even though the spec
+4. **Subtitles must start with a UTF-8 BOM**, even though the spec
    doesn't require one. The decoder silently drops anything else.
+5. **The DMR rejects long URLs with non-ASCII bytes or spaces** with
+   UPnP `716 Resource not found` — before it even tries to fetch the URL.
+   Filename `Реквием по мечте (2000).mkv` simply doesn't cast.
 
-CastToTV figures all three out automatically. The GUI is the kind of
+CastToTV figures all five out automatically. The GUI is the kind of
 thing you used to find on a warez floppy — and that's the point.
 
 ## How casting works
@@ -107,28 +114,60 @@ flowchart LR
 
 ## Features
 
-- **Three discovery paths.** SSDP M-SEARCH (the polite way), ICMP sweep
-  of the /24 (when the TV's UPnP stack is asleep), or just paste an IP.
-- **DLNA port auto-detection** — fingerprints `<MediaRenderer>` +
-  `<AVTransport>` in the device descriptor, so the random port LG hands
-  out each boot stops being a problem.
-- **Range-aware HTTP server** at port 8766 — seek bar in the GUI maps
-  to `Range: bytes=N-` requests, no re-encoding.
+- **Fast unified discovery.** One `< DISCOVER >` button runs SSDP
+  multicast and a parallel TCP scan of the entire `/24` on DLNA-relevant
+  ports (~400 workers, ~2 s) **at the same time**, then dedupes by
+  `(ip, port)`. Found device XMLs are fetched in parallel.
+- **Deep port-scan fallback** for hosts that don't reply to SSDP at all
+  (LG's DMR on some firmwares is mute on `1900/udp`). All 50 000 ports
+  scanned with 800-way concurrency in ~13 s, then each open port HTTP-
+  probed for `<MediaRenderer>` + `<AVTransport>`. Early-exit cancels the
+  remaining probes the moment a hit lands.
+- **Multi-device dropdown** — every renderer that came back via SSDP,
+  port-scan or unicast lookup is listed in the `[TV]` combobox; pick one
+  and the IP field syncs. Manual `CONNECT` adds to the same list with
+  `(ip, port)` dedup.
+- **File-scoped HTTP server.** The built-in server at `:8766` only
+  serves the exact video + optional subtitle for the active cast — any
+  other path is `404`. No directory listing, no other files leak.
+- **ASCII URL aliasing.** Cyrillic, spaces, parens, `&`, long paths —
+  none of that goes to the TV. URLs are normalised to `video.mkv` /
+  `subs.srt`; the original filename only lives in the DIDL `<dc:title>`
+  for the on-screen overlay. Fixes UPnP `716` on LG webOS.
+- **UPnP errorCode-aware retry.** `_soap_call` parses
+  `<errorCode>NNN</errorCode>` out of SOAP faults regardless of body
+  length, so `cast_video` can auto-recover from `701 Transition not
+  available` by sending `Stop` then re-issuing `SetAVTransportURI`.
+- **Pause / Resume.** `< PAUSE >` button toggles `Pause` / `Play` SOAP
+  actions; status label and button text reflect transport state.
+- **Range-aware HTTP server** — seek buttons (`<<30s` / `>>10s` / `>>5m`)
+  use DLNA `Seek` SOAP for native TV-side seeking; the server itself
+  honours `Range: bytes=N-M` for direct-file mode.
 - **External subtitles** — SRT, VTT, SUB, SMI. Delivered via
   `CaptionInfo.sec` HTTP header **and** `sec:CaptionInfoEx` DIDL-Lite
-  metadata, with UTF-8 BOM auto-prepended.
+  metadata (with `sec:type` + `sec:URIType`), and the file is served
+  with UTF-8 BOM auto-prepended.
 - **On-the-fly audio transcode** — AC3 / EAC3 / DTS / TrueHD / MLP get
   re-encoded to AAC stereo via ffmpeg pipe; video is copied losslessly.
-  Triggered automatically.
-- **Dongle mode** — for WiFi cast sticks, MPEG-TS in a memory buffer,
-  served as `video/MP2T` with `transferMode.dlna.org: Streaming`.
-  Seeking by re-spawning ffmpeg with `-ss`.
+  Auto-engages when `probe_file` flags a bad codec, or via the explicit
+  `[MODE] Force MPEG-TS` checkbox.
+- **Dongle mode** — for WiFi cast sticks, MPEG-TS in a 50 MB memory
+  ring buffer, served as `video/MP2T` with `transferMode.dlna.org:
+  Streaming` and `DLNA.ORG_OP=00` (no Range). Seeking re-spawns ffmpeg
+  with `-ss`.
+- **Duration in DIDL** — TV remote shows the full timeline immediately
+  instead of waiting on byte ranges to figure out the runtime.
+- **Socket-clean teardown.** `HTTPServerThread.stop()` calls both
+  `shutdown()` _and_ `server_close()` — without that, on Windows with
+  `SO_REUSEADDR` a fresh server binds alongside the dead one and Windows
+  hands incoming SYNs to either, causing random selftest timeouts on
+  recasts. Took an evening to figure out.
 - **One-click dongle WiFi reconfigure** — opens the dongle's setup web
   UI (`192.168.49.1`, `192.168.203.1`, `192.168.1.1`) when it forgets
   your network.
 - **Debug logger** — `cast_log.txt` next to the script, gated by the
   `DEBUG_VERBOSE` flag, captures every request, response code, DLNA
-  header, and access line. Saved my evening more than once.
+  header, SOAP body and access line. Saved my evening more than once.
 
 ## Case studies
 
@@ -168,19 +207,68 @@ buffer resets.
 That's the `DongleCaster` class. The dongle never sees a 206 response
 and never has to seek.
 
+### Case 3 — "SSDP says nothing, but the TV is right there"
+
+You're on a guest VLAN, or your AP has client isolation, or your mesh
+just doesn't relay multicast properly. You can `ping` the TV. The TV
+is happily showing the YouTube screensaver. `< DISCOVER >` returns
+zero devices, every time.
+
+The targeted /24 TCP scan still finds the host (port `7000` is open on
+LG webOS regardless of network state), but the SSDP follow-up to that
+host on `1900/udp` also fails — the LG webOS DMR doesn't always reply
+to unicast `M-SEARCH`. And worse: the AVTransport service randomises
+its port across `1000–50000`, so no fixed list catches it.
+
+The deep-scan fallback brute-forces all ~50 000 ports in parallel
+(~13 s on a typical LAN at 800-way concurrency), HTTP-probes each open
+port for the `MediaRenderer` + `AVTransport` device descriptor, and
+short-circuits the moment one matches. Total time: ~15 s from click to
+populated dropdown, with `<errorCode>` parsing for clean diagnostics
+on the way.
+
+```
+[FAST] discover on 192.168.100.0/24 — SSDP + port scan
+[LAN] 192.168.100.0/24: 1 host(s) with DLNA ports open
+[SSDP] 0 reply(s), 0 unique location(s)
+[FAST] 1 host(s) without SSDP reply — unicast probe
+[FAST] 1 host(s) need deep scan (no SSDP)
+[DEEP] 192.168.100.28: 16 open port(s)
+[DEEP] 192.168.100.28:1451 → [LG] webOS TV UP7750PTB
+[OK] 1 renderer(s) in 17.1s
+```
+
+### Case 4 — "UPnP 716, but the URL works in my browser"
+
+Your filename is `Реквием по мечте - Requiem for a Dream (2000).mkv`.
+The URL after `quote()` is 219 characters long with `%D0...%29` runs
+and spaces. `Selftest HEAD → 200`. TV: `<errorCode>716</errorCode>
+Resource not found` — and the TV never even sent a HEAD to your server.
+
+LG's DMR validates the URL string before fetching. Long URLs, Cyrillic
+bytes and parens trip it. The fix is to **only ever hand the TV an
+ASCII alias** (`video.mkv`, `subs.srt`) and have the HTTP server map
+that alias to the actual on-disk path. The Russian filename still
+appears on the TV's overlay via `<dc:title>` in DIDL — only the URL is
+sanitised.
+
 ## Quick start
 
 ```bash
 python cast_to_tv.py
 ```
 
-1. `< DISCOVER >` (SSDP) or `< NET SCAN >` (ICMP) — the IP fills in.
+1. `< DISCOVER >` — SSDP + parallel /24 TCP scan + deep port-scan
+   fallback, all in one click. Found renderers populate the `[TV]`
+   dropdown. (Or paste an IP and `CONNECT` for a single host.)
 2. `[...]` next to `[FILE]` — pick a video.
 3. `[...]` next to `[SUBS]` — optional, attach a subtitle.
-4. `<<< CAST >>>`.
-
-That's it. The seek bar (`<<30s`, `<<10s`, `>>10s`, `>>30s`, `>>5m`)
-works during playback.
+4. `[MODE] Force MPEG-TS` — optional, tick if you're casting to a
+   dongle or know your audio is AC3/DTS. (Auto-engaged on bad-codec
+   detect anyway.)
+5. `<<< CAST >>>`. Use `< PAUSE >` / `< STOP >` for transport control;
+   the seek bar (`<<30s` / `<<10s` / `>>10s` / `>>30s` / `>>5m`) works
+   during playback.
 
 ## Build a Windows executable
 
@@ -249,6 +337,13 @@ descend from each one.
 - [x] WiFi cast dongle MPEG-TS mode
 - [x] Dongle WiFi reconfigure shortcut
 - [x] File-based debug logger
+- [x] Fast parallel SSDP + /24 TCP scan unified into one click (`v0.5.0`)
+- [x] Deep port-scan fallback for SSDP-dead LANs / LG ephemeral port (`v0.5.0`)
+- [x] Multi-device dropdown (`v0.5.0`)
+- [x] File-scoped HTTP server — no directory listing (`v0.5.0`)
+- [x] ASCII URL aliasing — Cyrillic/spaces/parens stop tripping `716` (`v0.5.0`)
+- [x] UPnP errorCode-aware retry on `701 Transition not available` (`v0.5.0`)
+- [x] Pause / Resume button (`v0.5.0`)
 - [ ] Headless / CLI mode (`--cast file.mp4 --to 192.168.x.y`)
 - [ ] Subtitle styling overrides (currently TV defaults)
 - [ ] Chromecast — separate protocol stack, may never happen

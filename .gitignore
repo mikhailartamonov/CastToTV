@@ -6,3 +6,5 @@ __pycache__/
 *.egg-info/
 *.spec
 !CastToTV.spec
+cast_log.txt
+
