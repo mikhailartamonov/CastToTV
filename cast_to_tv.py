@@ -213,7 +213,130 @@ class DongleCaster:
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
 
+    def start_youtube(self, url, duration_str=None, callback=None):
+        """yt-dlp --get-url → ffmpeg direct stream → MPEG-TS → HTTP."""
+        self.stop()
+        self.buf = bytearray()
+        self.done = False
+        self.served = 0
+        self.duration = duration_str
+        self._yt_proc = None
+
+        yt_env = {**os.environ,
+                  'PATH': os.path.expanduser('~/.deno/bin') + ':' + os.environ.get('PATH', '')}
+
+        # Get direct stream URL(s) from yt-dlp
+        if callback:
+            callback("[YT] Resolving stream URL via yt-dlp...")
+        r = subprocess.run(
+            ['yt-dlp',
+             '--extractor-args', 'youtube:player_client=android_vr,web',
+             '--no-playlist', '-f',
+             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+             '-g', url],
+            capture_output=True, text=True, timeout=30, env=yt_env
+        )
+        stream_urls = [u.strip() for u in r.stdout.strip().splitlines() if u.strip()]
+        if not stream_urls:
+            if callback:
+                callback(f"[YT] yt-dlp -g failed: {r.stderr.strip()[-200:]}")
+            return
+
+        if callback:
+            callback(f"[YT] Got {len(stream_urls)} stream URL(s) — starting ffmpeg...")
+
+        # Build ffmpeg command: one or two input URLs (video + audio) → MPEG-TS
+        ff_cmd = ['ffmpeg']
+        for su in stream_urls:
+            ff_cmd += ['-i', su]
+        if len(stream_urls) == 2:
+            ff_cmd += ['-map', '0:v:0', '-map', '1:a:0']
+        ff_cmd += ['-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
+                   '-f', 'mpegts', 'pipe:1']
+
+        self.proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     env=yt_env)
+
+        def reader():
+            while self.proc and self.proc.poll() is None:
+                chunk = self.proc.stdout.read(256 * 1024)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buf.extend(chunk)
+            self.done = True
+            try:
+                os.remove(fifo)
+            except OSError:
+                pass
+        threading.Thread(target=reader, daemon=True).start()
+
+        # Prefill: wait for 10 MB before starting to stream
+        for _ in range(120):
+            time.sleep(0.5)
+            with self.lock:
+                sz = len(self.buf)
+            if sz > 10 * 1024 * 1024:
+                break
+            if self.proc.poll() is not None:
+                break
+        if callback:
+            callback(f"[YT] Buffered {sz // 1024 // 1024} MB — streaming to TV")
+
+        caster = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.send_header('contentFeatures.dlna.org',
+                                 'DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000')
+                self.end_headers()
+                pos = 0
+                stall = 0
+                try:
+                    while stall < 100:
+                        with caster.lock:
+                            avail = len(caster.buf) - pos
+                        if avail > 0:
+                            with caster.lock:
+                                chunk = bytes(caster.buf[pos:pos + 64 * 1024])
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            pos += len(chunk)
+                            caster.served = max(caster.served, pos)
+                            stall = 0
+                        elif caster.done:
+                            break
+                        else:
+                            time.sleep(0.1)
+                            stall += 1
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.end_headers()
+
+            def log_message(self, *a):
+                _file_log(f"[YT-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
+
+        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
+        self.srv.allow_reuse_address = True
+        self.srv.daemon_threads = True
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
     def stop(self):
+        if hasattr(self, '_yt_proc') and self._yt_proc and self._yt_proc.poll() is None:
+            try:
+                self._yt_proc.kill()
+            except Exception:
+                pass
+        self._yt_proc = None
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.kill()
@@ -291,10 +414,12 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Serves ONLY the registered video + optional subtitle for this cast. Anything else → 404."""
 
     def __init__(self, *args, video_path=None, subtitle_path=None, subtitle_url=None,
-                 video_url_name=None, subtitle_url_name=None, **kwargs):
+                 video_url_name=None, subtitle_url_name=None,
+                 total_size=0, **kwargs):
         self.video_path = video_path
         self.subtitle_path = subtitle_path
         self.subtitle_url = subtitle_url
+        self.total_size = total_size  # non-zero → growing file mode (yt stream)
         # URL-served names — may be ASCII aliases to dodge DMR quirks with Cyrillic/spaces/etc
         self.video_url_name = video_url_name or (os.path.basename(video_path) if video_path else None)
         self.subtitle_url_name = subtitle_url_name or (os.path.basename(subtitle_path) if subtitle_path else None)
@@ -340,7 +465,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
             return None
 
         fs = os.fstat(f.fileno())
-        file_size = fs.st_size
+        file_size = self.total_size if self.total_size else fs.st_size
 
         if range_header and range_header != '-':
             match = re.match(r'bytes=(\d*)-(\d*)', range_header)
@@ -353,6 +478,15 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_error(416, 'Range Not Satisfiable')
                     return None
                 end = min(end, file_size - 1)
+                # Growing file: wait until enough data is downloaded
+                if self.total_size:
+                    deadline = time.time() + 60
+                    while time.time() < deadline:
+                        current = os.fstat(f.fileno()).st_size
+                        if current > start:
+                            end = min(end, current - 1)
+                            break
+                        time.sleep(0.3)
                 length = end - start + 1
                 self.send_response(206)
                 self.send_header('Content-Type', ctype)
@@ -444,15 +578,130 @@ class SilentThreadingTCPServer(socketserver.ThreadingTCPServer):
         else:
             super().handle_error(request, client_address)
 
+_YT_DOMAINS = ('youtube.com', 'youtu.be', 'youtu.be/', 'yt.be')
+
+def is_youtube_url(text):
+    return any(d in text for d in _YT_DOMAINS) or (
+        text.startswith(('http://', 'https://')) and
+        any(text.split('://', 1)[-1].startswith(d) for d in _YT_DOMAINS)
+    )
+
+
+class YoutubeStreamer:
+    """Downloads a YouTube URL via yt-dlp into a temp file while exposing progress."""
+
+    TEMP_PATH = '/tmp/cast_yt_stream.mp4'
+
+    def __init__(self, url, callback=None):
+        self.url = url
+        self.callback = callback or (lambda m: None)
+        self.total_size = 0
+        self.duration = None
+        self.proc = None
+        self._done = False
+        self._error = None
+
+    _FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    _YTDLP_EXTRA = [
+        '--extractor-args', 'youtube:player_client=android_vr,web',
+        '--no-playlist', '--newline',
+    ]
+    _ENV = {**__import__('os').environ,
+            'PATH': __import__('os').path.expanduser('~/.deno/bin') + ':' +
+                    __import__('os').environ.get('PATH', '')}
+
+    def probe(self):
+        """Fetch filesize + duration before download starts. Returns True on success."""
+        try:
+            r = subprocess.run(
+                ['yt-dlp', '-f', self._FORMAT] + self._YTDLP_EXTRA +
+                ['--print', '%(filesize,filesize_approx)s', '--print', '%(duration)s', self.url],
+                capture_output=True, text=True, timeout=15, env=self._ENV
+            )
+            lines = r.stdout.strip().splitlines()
+            if lines:
+                try:
+                    self.total_size = int(lines[0])
+                except (ValueError, IndexError):
+                    self.total_size = 0
+            if len(lines) > 1:
+                try:
+                    secs = float(lines[1])
+                    m, s = divmod(int(secs), 60)
+                    h, m = divmod(m, 60)
+                    self.duration = f"{h:02d}:{m:02d}:{s:02d}" if h else f"00:{m:02d}:{s:02d}"
+                except (ValueError, IndexError):
+                    pass
+            return True
+        except Exception as e:
+            self._error = str(e)
+            return False
+
+    def start(self):
+        """Start background download to TEMP_PATH."""
+        import glob
+        # Clean up any leftover partial files from previous runs
+        for f in glob.glob(self.TEMP_PATH.replace('.mp4', '.*')):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        self.proc = subprocess.Popen(
+            ['yt-dlp', '-f', self._FORMAT] + self._YTDLP_EXTRA +
+            ['-o', self.TEMP_PATH, self.url],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self._ENV
+        )
+        def _monitor():
+            for line in self.proc.stdout:
+                line = line.strip()
+                if line:
+                    self.callback(f"[YT] {line}")
+            self.proc.wait()
+            if self.proc.returncode == 0:
+                self._done = True
+                self.callback("[YT] Download complete")
+            else:
+                self._error = f"yt-dlp exit {self.proc.returncode}"
+                self.callback(f"[YT] Error: {self._error}")
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    @property
+    def active_path(self):
+        """Return the largest existing file matching our temp prefix (final or partial)."""
+        import glob
+        candidates = glob.glob(self.TEMP_PATH.replace('.mp4', '*.mp4'))
+        candidates = [p for p in candidates if os.path.exists(p)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: os.path.getsize(p))
+
+    @property
+    def downloaded(self):
+        p = self.active_path
+        try:
+            return os.path.getsize(p) if p else 0
+        except OSError:
+            return 0
+
+    @property
+    def done(self):
+        return self._done
+
+
 class HTTPServerThread:
     def __init__(self, port, video_path, subtitle_path=None,
-                 video_url_name=None, subtitle_url_name=None):
+                 video_url_name=None, subtitle_url_name=None, total_size=0):
         self.port = port
         self.video_path = os.path.abspath(video_path) if video_path else None
         self.subtitle_path = os.path.abspath(subtitle_path) if subtitle_path else None
         self.video_url_name = video_url_name or (os.path.basename(self.video_path) if self.video_path else None)
         self.subtitle_url_name = subtitle_url_name or (os.path.basename(self.subtitle_path) if self.subtitle_path else None)
         self.subtitle_url = None
+        self.total_size = total_size
         self.server = None
         self.thread = None
         self.running = False
@@ -467,6 +716,7 @@ class HTTPServerThread:
             subtitle_url=self.subtitle_url,
             video_url_name=self.video_url_name,
             subtitle_url_name=self.subtitle_url_name,
+            total_size=self.total_size,
             **kwargs)
         self.server = SilentThreadingTCPServer(('0.0.0.0', self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -703,7 +953,7 @@ def _ssdp_unicast_lookup(ip, timeout=1.0):
     return None
 
 
-def fast_discover(callback=None, cancel_check=None):
+def fast_discover(callback=None, cancel_check=None, on_device=None):
     """SSDP multicast + parallel /24 port scan, run concurrently. Deduped, sorted by IP."""
     prefix = get_network_prefix()
     if callback:
@@ -711,11 +961,30 @@ def fast_discover(callback=None, cancel_check=None):
 
     ssdp_devices = []
     lan_hosts = []
+    devices_by_key = {}
+    covered_ips = set()
+    _lock = threading.Lock()
+
+    def _emit(d, label=None):
+        key = (d['ip'], d['port'])
+        with _lock:
+            if key in devices_by_key:
+                return False
+            devices_by_key[key] = d
+            covered_ips.add(d['ip'])
+        if callback and label:
+            callback(label)
+        if on_device:
+            on_device(d)
+        return True
 
     def do_ssdp():
-        ssdp_devices.extend(discover_dlna_renderers(timeout=2, retries=3,
-                                                     callback=callback,
-                                                     cancel_check=cancel_check))
+        devs = discover_dlna_renderers(timeout=2, retries=3,
+                                       callback=callback,
+                                       cancel_check=cancel_check)
+        for d in devs:
+            _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
+        ssdp_devices.extend(devs)
 
     def do_lan():
         lan_hosts.extend(fast_lan_scan(prefix, callback=callback,
@@ -726,9 +995,6 @@ def fast_discover(callback=None, cancel_check=None):
     t1.start(); t2.start()
     t1.join(); t2.join()
 
-    devices_by_key = {(d['ip'], d['port']): d for d in ssdp_devices}
-    covered_ips = {d['ip'] for d in ssdp_devices}
-
     # For LAN hosts that didn't reply to multicast SSDP, try unicast in parallel
     unicast_ips = [ip for ip in lan_hosts if ip not in covered_ips]
     if unicast_ips and not (cancel_check and cancel_check()):
@@ -738,15 +1004,9 @@ def fast_discover(callback=None, cancel_check=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             for d in ex.map(_ssdp_unicast_lookup, unicast_ips):
                 if d:
-                    key = (d['ip'], d['port'])
-                    if key not in devices_by_key:
-                        devices_by_key[key] = d
-                        covered_ips.add(d['ip'])
-                        if callback:
-                            callback(f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
+                    _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
 
     # Last resort: hosts that responded to TCP but have no SSDP at all (some LG webOS TVs).
-    # Deep-scan ports in parallel and HTTP-probe for AVTransport.
     deep_ips = [ip for ip in lan_hosts if ip not in covered_ips]
     if deep_ips and not (cancel_check and cancel_check()):
         if callback:
@@ -756,11 +1016,7 @@ def fast_discover(callback=None, cancel_check=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(deep_ips))) as ex:
             for d in ex.map(_deep, deep_ips):
                 if d:
-                    key = (d['ip'], d['port'])
-                    if key not in devices_by_key:
-                        devices_by_key[key] = d
-                        if callback:
-                            callback(f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']}) via deep scan")
+                    _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']}) via deep scan")
 
     return sorted(devices_by_key.values(),
                    key=lambda x: (tuple(int(o) for o in x['ip'].split('.')), x['port']))
@@ -1446,14 +1702,17 @@ class KeygenApp:
         """Fast combined discovery: SSDP multicast + parallel TCP scan of DLNA ports across /24."""
         def run():
             self.set_scanning(True)
+            self.device_list = []
             t0 = time.time()
             devices = fast_discover(callback=self.log,
-                                    cancel_check=lambda: self.cancel_flag)
+                                    cancel_check=lambda: self.cancel_flag,
+                                    on_device=lambda d: self.root.after(0, lambda dev=d: self._add_device(dev)))
             elapsed = time.time() - t0
             if self.cancel_flag:
                 self.set_scanning(False)
                 return
-            self._populate_devices(devices)
+            if not self.device_list:
+                self._populate_devices(devices)
             if devices:
                 self.log(f"[OK] {len(devices)} renderer(s) in {elapsed:.1f}s")
             else:
@@ -1548,7 +1807,24 @@ class KeygenApp:
             sub_url = None
             video_mime = 'video/mp4'
             duration = None
-            if video.startswith("http"):
+            if is_youtube_url(video):
+                # ---- YouTube: yt-dlp → FIFO → ffmpeg → MPEG-TS → HTTP → DLNA ----
+                self.log(f"[YT] Detected YouTube URL — probing...")
+                streamer = YoutubeStreamer(video, callback=self.log)
+                streamer.probe()
+                self.log(f"[YT] Duration: {streamer.duration or 'unknown'}")
+                local = get_local_ip()
+                if self.dongle_caster is None:
+                    self.dongle_caster = DongleCaster(self.server_port + 2)
+                self.dongle_caster.start_youtube(video,
+                                                  duration_str=streamer.duration,
+                                                  callback=self.log)
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                name = 'YouTube Stream'
+                duration = streamer.duration
+                video_mime = 'video/MP2T'
+                self.log(f"[YT] Streaming: {url}")
+            elif video.startswith("http"):
                 url = video
                 name = video.split('/')[-1][:40]
             else:
@@ -1685,7 +1961,7 @@ class KeygenApp:
 
             self.log(f"[CAST] {self.discovered_device['friendly_name']}")
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
-            title = os.path.splitext(name)[0] if not video.startswith('http') else 'Video'
+            title = os.path.splitext(name)[0] if not video.startswith('http') and not is_youtube_url(video) else name
             ok, msg = cast_video(url, control, subtitle_url=sub_url,
                                  video_mime=video_mime, duration=duration,
                                  title=title, callback=self.log)
