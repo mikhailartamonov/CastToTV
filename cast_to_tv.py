@@ -598,7 +598,8 @@ class YoutubeStreamer:
         self.proc = None         # ffmpeg
         self.srv = None
         self.thread = None
-        self._done = False
+        self._done = False        # ffmpeg finished muxing
+        self._completed = False   # a client has streamed the file to EOF (→ don't replay)
         self._error = None
 
     def _ytdlp(self, *extra):
@@ -701,6 +702,17 @@ class YoutubeStreamer:
 
             def do_GET(self):
                 self._hdr()
+                # Play-once: once the whole file has been streamed to a client, a DLNA dongle
+                # that re-requests the URL on EOF would otherwise loop. Serve nothing so it stops.
+                if streamer._completed:
+                    return
+                # ffmpeg may not have created the file yet on a very early connect — wait briefly.
+                waited = 0
+                while not os.path.exists(streamer.path) and waited < 100 and not streamer._done:
+                    time.sleep(0.1)
+                    waited += 1
+                if not os.path.exists(streamer.path):
+                    return
                 stall = 0
                 try:
                     with open(streamer.path, 'rb') as f:   # tail the growing file
@@ -716,6 +728,7 @@ class YoutubeStreamer:
                                     self.wfile.write(chunk)
                                     self.wfile.flush()
                                     continue
+                                streamer._completed = True  # reached true EOF — don't replay
                                 break
                             else:
                                 time.sleep(0.1)
