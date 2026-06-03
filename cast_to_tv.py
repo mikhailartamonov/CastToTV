@@ -600,6 +600,7 @@ class YoutubeStreamer:
         self.thread = None
         self._done = False        # ffmpeg finished muxing
         self._completed = False   # a client has streamed the file to EOF (→ don't replay)
+        self._is_hls = False      # source is HLS (m3u8) → re-encode video, don't copy
         self._error = None
 
     def _ytdlp(self, *extra):
@@ -625,6 +626,8 @@ class YoutubeStreamer:
         fmts = info.get('requested_formats') or ([info] if info.get('url') else [])
         urls = [f.get('url') for f in fmts if f.get('url')]
         self.total_size = sum(int(f.get('filesize') or f.get('filesize_approx') or 0) for f in fmts)
+        self._is_hls = any('m3u8' in (f.get('protocol') or '') or 'hls' in (f.get('protocol') or '')
+                           for f in fmts)
         if not urls:
             self._error = 'no playable stream URL'
             self.callback(f"[YT] {self._error}")
@@ -640,9 +643,15 @@ class YoutubeStreamer:
             cmd += ['-i', su]
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
-        # copy video, normalise audio to stereo AAC (DLNA/Chromecast-safe), MPEG-TS to disk
-        cmd += ['-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-                '-f', 'mpegts', self.path]
+        if self._is_hls:
+            # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities and no
+            # repeated SPS/PPS at segment joins → cheap dongles freeze the picture there. Re-encode
+            # to a clean, capped H.264 with regular keyframes so playback stays continuous.
+            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-level', '3.1',
+                    '-pix_fmt', 'yuv420p', '-vf', "scale='min(1280,iw)':-2", '-g', '48']
+        else:
+            cmd += ['-c:v', 'copy']   # progressive H.264 (YouTube etc.) — copy is fine and fast
+        cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
         self.callback("[YT] Muxing stream to disk (ffmpeg)...")
         self._errlog = os.path.join(self._dir, 'ffmpeg.log')
         errf = open(self._errlog, 'w')
@@ -663,7 +672,7 @@ class YoutubeStreamer:
                         tail = ' | '.join(tail)
                 except OSError:
                     pass
-                self.callback(f"[YT] ffmpeg exit {self.proc.returncode}: {tail}")
+                self.callback(f"[YT] ffmpeg exit {proc.returncode}: {tail}")
         threading.Thread(target=_wait, daemon=True).start()
         self._serve()
 
