@@ -581,7 +581,10 @@ class YoutubeStreamer:
     Playback starts a few seconds in; we never wait for the whole download.
     """
 
-    _FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    # Force H.264 (avc1) video, not AV1/VP9: cheap dongles & TVs decode H.264 in hardware but
+    # play AV1 as audio-only (black screen). Cap at 1080p for the same reason.
+    _FORMAT = ('bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]/'
+               'best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best')
 
     def __init__(self, url, port, callback=None):
         self.url = url
@@ -640,13 +643,26 @@ class YoutubeStreamer:
         cmd += ['-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
                 '-f', 'mpegts', self.path]
         self.callback("[YT] Muxing stream to disk (ffmpeg)...")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._errlog = os.path.join(self._dir, 'ffmpeg.log')
+        errf = open(self._errlog, 'w')
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
+        proc = self.proc   # local ref: stop() may null self.proc while _wait runs
 
         def _wait():
-            self.proc.wait()
+            proc.wait()
+            errf.close()
             self._done = True
-            self.callback("[YT] Source finished" if self.proc.returncode == 0
-                          else f"[YT] ffmpeg exit {self.proc.returncode}")
+            if proc.returncode == 0:
+                self.callback("[YT] Source finished")
+            else:
+                tail = ''
+                try:
+                    with open(self._errlog) as f:
+                        tail = f.read().strip().splitlines()[-2:]
+                        tail = ' | '.join(tail)
+                except OSError:
+                    pass
+                self.callback(f"[YT] ffmpeg exit {self.proc.returncode}: {tail}")
         threading.Thread(target=_wait, daemon=True).start()
         self._serve()
 
