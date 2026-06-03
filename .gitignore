@@ -8,3 +8,5 @@ __pycache__/
 !CastToTV.spec
 cast_log.txt
 
+
+.venv/
