@@ -644,11 +644,14 @@ class YoutubeStreamer:
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
         if self._is_hls:
-            # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities and no
-            # repeated SPS/PPS at segment joins → cheap dongles freeze the picture there. Re-encode
-            # to a clean, capped H.264 with regular keyframes so playback stays continuous.
-            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-level', '3.1',
-                    '-pix_fmt', 'yuv420p', '-vf', "scale='min(1280,iw)':-2", '-g', '48']
+            # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities → dongles
+            # freeze at segment joins. Re-encode to clean H.264. Use *baseline* (no B-frames, no
+            # CABAC), the profile cheap hardware decoders handle reliably — main/high B-frames make
+            # some dongles show frame 1 then freeze. Cap to 720p, keyframe every ~2s.
+            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+                    '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
+                    '-vf', "scale='min(1280,iw)':-2", '-g', '48', '-bf', '0',
+                    '-maxrate', '6M', '-bufsize', '12M']
         else:
             cmd += ['-c:v', 'copy']   # progressive H.264 (YouTube etc.) — copy is fine and fast
         cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
