@@ -1629,6 +1629,16 @@ class KeygenApp:
                        selectcolor='#001100',
                        state='normal' if HAS_FFMPEG else 'disabled').pack(side='left')
 
+        # Multi-room: fan the same stream out to every discovered room at once.
+        self.multi_var = tk.IntVar(value=0)
+        tk.Checkbutton(mode_frame,
+                       text="[MULTI] all rooms (sync)",
+                       variable=self.multi_var,
+                       font=(MONO, 8, "bold"),
+                       fg='#00FFAA', bg='#000000',
+                       activeforeground='#00FFCC', activebackground='#000000',
+                       selectcolor='#001100').pack(side='right')
+
         # Buttons row 1
         btn1 = tk.Frame(frame, bg='#000000')
         btn1.pack(pady=8)
@@ -1976,6 +1986,41 @@ class KeygenApp:
             return False, "Miracast is screen-mirroring only — use the system display helper"
         return False, f"protocol '{protocol}' not supported yet"
 
+    def _dedupe_targets(self, devices):
+        """Collapse multiple entries for the same physical box (a dongle that answers both
+        DLNA and AirPlay shouldn't get the stream twice) — keep the first per IP."""
+        seen, out = set(), []
+        for d in devices:
+            ip = d.get('ip')
+            if ip in seen:
+                continue
+            seen.add(ip)
+            out.append(d)
+        return out
+
+    def cast_to_all(self, targets, source):
+        """Fan one MediaSource out to N rooms. A threading.Barrier releases every Play at the
+        same instant (best-effort sync — independent clocks still drift a few seconds).
+        Returns a list of (target, ok, message)."""
+        results, lock = [], threading.Lock()
+        barrier = threading.Barrier(len(targets))
+
+        def fire(t):
+            try:
+                barrier.wait(timeout=12)   # line everyone up, then fire together
+            except Exception:
+                pass
+            ok, msg = self.play_on(t, source)
+            with lock:
+                results.append((t, ok, msg))
+
+        threads = [threading.Thread(target=fire, args=(t,), daemon=True) for t in targets]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=30)
+        return results
+
     def _play_airplay(self, target, source):
         """Stream a MediaSource to an AirPlay receiver via pyatv (fire-and-forget on the loop)."""
         if not HAS_AIRPLAY:
@@ -2206,7 +2251,17 @@ class KeygenApp:
             title = os.path.splitext(name)[0] if not video.startswith('http') and not is_extractable_url(video) else name
             source = MediaSource(url, mime=video_mime, title=title,
                                  duration=duration, subtitle_url=sub_url)
-            ok, msg = self.play_on(self.discovered_device, source)
+            if self.multi_var.get() and len(self.device_list) > 1:
+                targets = self._dedupe_targets(self.device_list)
+                self.log(f"[MULTI] Casting to {len(targets)} room(s), synchronised start...")
+                results = self.cast_to_all(targets, source)
+                ok_n = sum(1 for _, ok_i, _ in results if ok_i)
+                for t, ok_i, m in results:
+                    self.log(f"[MULTI] {self._device_label(t)} -> {'OK' if ok_i else 'FAIL: ' + m}")
+                ok = ok_n > 0
+                msg = f"{ok_n}/{len(results)} room(s) playing"
+            else:
+                ok, msg = self.play_on(self.discovered_device, source)
             if ok:
                 self.log("[OK] Streaming started!")
                 if sub_url:
