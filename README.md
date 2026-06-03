@@ -249,7 +249,7 @@ install. *(Build scripts land with Phase 6 — see Roadmap.)*
 - [x] **`MediaSource` / `play_on` cast abstraction**
 - [x] **Chromecast backend (pychromecast)**
 - [x] **AirPlay backend (pyatv)**
-- [ ] Multi-room multi-select + `cast_to_all` barrier
+- [x] **Multi-room `[MULTI]` cast — `cast_to_all` barrier, best-effort sync**
 - [ ] Standalone bundled binaries (Windows / Ubuntu / Arch)
 - [ ] Miracast helper integration
 - [ ] [Stream from magnet / torrent](https://github.com/mikhailartamonov/CastToTV/issues/1)
