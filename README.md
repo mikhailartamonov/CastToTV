@@ -29,6 +29,11 @@
 
 ![CastToTV on Linux](docs/images/main-linux.png)
 
+*One `< DISCOVER >` sweeps DLNA (SSDP + /24 scan), Chromecast (mDNS) and
+AirPlay (mDNS) and merges everything into one protocol-tagged dropdown:*
+
+![Multi-protocol discovery on Linux](docs/images/devices-linux.png)
+
 ## What it does
 
 CastToTV discovers every cast-capable device on your LAN — across **four
