@@ -139,6 +139,13 @@ try:
 except Exception:
     HAS_CHROMECAST = False
 
+try:
+    import asyncio
+    import pyatv
+    HAS_AIRPLAY = True
+except Exception:
+    HAS_AIRPLAY = False
+
 
 def discover_chromecasts(timeout=4):
     """Blocking Chromecast scan. Returns (cast_objects, browser); each cast exposes
@@ -146,6 +153,44 @@ def discover_chromecasts(timeout=4):
     if not HAS_CHROMECAST:
         return [], None
     return pychromecast.get_chromecasts(timeout=timeout)
+
+
+class _AsyncLoop:
+    """A background asyncio event loop so pyatv's coroutines can be driven from the Tk thread.
+
+    pyatv is asyncio-only; the rest of the app is thread-based. We run one private loop in a
+    daemon thread and submit coroutines to it via run_coroutine_threadsafe.
+    """
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run(self, coro, timeout=None):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def submit(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def stop(self):
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+
+
+def discover_airplay(aloop, timeout=4):
+    """Scan for AirPlay / Apple TV receivers. Returns a list of pyatv configs (each has
+    .name / .address / .identifier). Runs on the shared async loop."""
+    if not HAS_AIRPLAY:
+        return []
+    async def _scan():
+        return await pyatv.scan(aloop.loop, timeout=timeout)
+    return aloop.run(_scan(), timeout=timeout + 6)
 
 
 class DongleCaster:
@@ -1457,6 +1502,8 @@ class KeygenApp:
         self.youtube_streamer = None
         self._cc_casts = {}       # uuid -> pychromecast.Chromecast (live, from discovery)
         self._cc_browser = None   # kept alive for the session so cast objects stay connected
+        self._airplay_confs = {}  # identifier -> pyatv config (from discovery)
+        self._aloop = None        # lazily-created background asyncio loop for pyatv
         self.paused = False
 
         # Truncate log file at startup so it holds only the current run
@@ -1782,6 +1829,8 @@ class KeygenApp:
                                     on_device=lambda d: self.root.after(0, lambda dev=d: self._add_device(dev)))
             if HAS_CHROMECAST and not self.cancel_flag:
                 self._discover_chromecasts()
+            if HAS_AIRPLAY and not self.cancel_flag:
+                self._discover_airplay()
             elapsed = time.time() - t0
             if self.cancel_flag:
                 self.set_scanning(False)
@@ -1814,6 +1863,28 @@ class KeygenApp:
                    'protocol': 'chromecast', 'uuid': uuid, 'control_url': None}
             self.root.after(0, lambda d=dev: self._add_device(d))
             self.log(f"[CC] {ci.friendly_name} ({ci.host})")
+
+    def _ensure_aloop(self):
+        if self._aloop is None:
+            self._aloop = _AsyncLoop()
+        return self._aloop
+
+    def _discover_airplay(self):
+        """Add AirPlay / Apple TV receivers to the dropdown, tagged [AIRPLAY]. Configs are
+        kept in self._airplay_confs so play_on() can connect without re-scanning."""
+        self.log("[AP] Scanning for AirPlay / Apple TV...")
+        try:
+            confs = discover_airplay(self._ensure_aloop(), timeout=4)
+        except Exception as e:
+            self.log(f"[AP] discovery error: {e}")
+            return
+        for c in confs:
+            ident = c.identifier or str(c.address)
+            self._airplay_confs[ident] = c
+            dev = {'ip': str(c.address), 'port': 0, 'friendly_name': c.name,
+                   'protocol': 'airplay', 'uuid': ident, 'control_url': None}
+            self.root.after(0, lambda d=dev: self._add_device(d))
+            self.log(f"[AP] {c.name} ({c.address})")
 
     def do_seek(self, delta_secs):
         """Seek via DLNA Seek SOAP — TV handles position natively for direct file streams."""
@@ -1897,7 +1968,41 @@ class KeygenApp:
                               duration=source.duration, title=source.title, callback=self.log)
         if protocol == 'chromecast':
             return self._play_chromecast(target, source)
+        if protocol == 'airplay':
+            return self._play_airplay(target, source)
+        if protocol == 'miracast':
+            # Miracast mirrors the whole screen over Wi-Fi Direct — it's not an in-app HTTP
+            # stream, so we can't push a single source to it from here. See README/help.
+            return False, "Miracast is screen-mirroring only — use the system display helper"
         return False, f"protocol '{protocol}' not supported yet"
+
+    def _play_airplay(self, target, source):
+        """Stream a MediaSource to an AirPlay receiver via pyatv (fire-and-forget on the loop)."""
+        if not HAS_AIRPLAY:
+            return False, "pyatv not installed"
+        conf = self._airplay_confs.get(target.get('uuid'))
+        if conf is None:
+            return False, "AirPlay device not found — run DISCOVER again"
+        aloop = self._ensure_aloop()
+
+        async def _go():
+            atv = await pyatv.connect(conf, aloop.loop)
+            try:
+                await atv.stream.play_url(source.url)
+            finally:
+                atv.close()
+
+        try:
+            fut = aloop.submit(_go())   # play_url runs until the clip ends; don't block the UI
+        except Exception as e:
+            return False, f"AirPlay error: {type(e).__name__}: {e}"
+
+        def _done(f):
+            exc = f.exception()
+            if exc:
+                self.log(f"[AP] play error: {type(exc).__name__}: {exc}")
+        fut.add_done_callback(_done)
+        return True, "AirPlay started"
 
     def _play_chromecast(self, target, source):
         """Hand a MediaSource to a Chromecast via pychromecast's MediaController."""
@@ -2131,6 +2236,8 @@ class KeygenApp:
                 pychromecast.discovery.stop_discovery(self._cc_browser)
             except Exception:
                 pass
+        if self._aloop is not None:
+            self._aloop.stop()
         self.root.destroy()
 
 def main():
