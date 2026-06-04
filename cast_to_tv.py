@@ -624,6 +624,7 @@ class YoutubeStreamer:
         self.content_length = 0
         self.play_duration = None   # HH:MM:SS the renderer should show (full − seek)
         self.play_seconds = 0       # same as a float, for the DLNA TimeSeekRange npt header
+        self._headers = []          # per-stream-URL HTTP headers from yt-dlp (User-Agent/Referer)
         self._error = None
 
     def _ytdlp(self, *extra):
@@ -652,8 +653,12 @@ class YoutubeStreamer:
         if info.get('duration'):
             self.duration_seconds = int(info['duration'])
             self.duration = format_duration(info['duration'])
-        fmts = info.get('requested_formats') or ([info] if info.get('url') else [])
-        urls = [f.get('url') for f in fmts if f.get('url')]
+        fmts = [f for f in (info.get('requested_formats') or ([info] if info.get('url') else []))
+                if f.get('url')]
+        urls = [f.get('url') for f in fmts]
+        # Per-format HTTP headers (User-Agent / Referer / …) — some CDNs (VK/OK okcdn.ru) 400 a
+        # plain ffmpeg request, so we replay yt-dlp's headers when opening each input.
+        self._headers = [f.get('http_headers') or {} for f in fmts]
         self.total_size = sum(int(f.get('filesize') or f.get('filesize_approx') or 0) for f in fmts)
         self._is_hls = any('m3u8' in (f.get('protocol') or '') or 'hls' in (f.get('protocol') or '')
                            for f in fmts)
@@ -671,7 +676,14 @@ class YoutubeStreamer:
         self._dir = tempfile.mkdtemp(prefix='casttotv_')
         self.path = os.path.join(self._dir, 'stream.ts')
         cmd = [resolve_binary('ffmpeg'), '-loglevel', 'error']
-        for su in stream_urls:
+        for i, su in enumerate(stream_urls):
+            hdr = self._headers[i] if i < len(self._headers) else {}
+            ua = hdr.get('User-Agent')
+            if ua:                                          # CDNs like VK/OK 400 ffmpeg's default UA
+                cmd += ['-user_agent', ua]
+            others = ''.join(f'{k}: {v}\r\n' for k, v in hdr.items() if k.lower() != 'user-agent')
+            if others:
+                cmd += ['-headers', others]
             if seek_seconds:
                 cmd += ['-ss', str(int(seek_seconds))]   # per-input seek keeps A/V aligned
             cmd += ['-i', su]
