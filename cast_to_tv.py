@@ -614,10 +614,15 @@ class YoutubeStreamer:
         Returns the URL list (1 = progressive, 2 = separate video+audio) or [] on failure."""
         try:
             r = subprocess.run(self._ytdlp('-f', self._FORMAT, '-J', self.url),
-                               capture_output=True, text=True, timeout=30)
-            info = json.loads(r.stdout)
+                               capture_output=True, text=True, timeout=60)
+            info = json.loads(r.stdout) if r.stdout.strip() else None
         except Exception as e:
             self._error = f'yt-dlp probe failed: {e}'
+            self.callback(f"[YT] {self._error}")
+            return []
+        if not isinstance(info, dict):
+            # yt-dlp returned nothing usable (rate-limited, geo-blocked, extractor error, …)
+            self._error = 'yt-dlp returned no data: ' + ((r.stderr or '').strip()[-200:] or 'empty')
             self.callback(f"[YT] {self._error}")
             return []
         self.title = info.get('title')
@@ -633,13 +638,18 @@ class YoutubeStreamer:
             self.callback(f"[YT] {self._error}")
         return urls
 
-    def start(self, stream_urls):
-        """Mux the resolved stream URL(s) into a growing MPEG-TS temp file and start serving."""
+    def start(self, stream_urls, seek_seconds=0, max_width=1280):
+        """Mux the resolved stream URL(s) into a growing MPEG-TS temp file and start serving.
+
+        seek_seconds: start playback this many seconds in (input seek — fast). max_width: cap
+        the re-encoded HLS video width (1280 = 720p default; 1920 = 1080p)."""
         import tempfile
         self._dir = tempfile.mkdtemp(prefix='casttotv_')
         self.path = os.path.join(self._dir, 'stream.ts')
         cmd = [resolve_binary('ffmpeg'), '-loglevel', 'error']
         for su in stream_urls:
+            if seek_seconds:
+                cmd += ['-ss', str(int(seek_seconds))]   # per-input seek keeps A/V aligned
             cmd += ['-i', su]
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
@@ -647,11 +657,13 @@ class YoutubeStreamer:
             # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities → dongles
             # freeze at segment joins. Re-encode to clean H.264. Use *baseline* (no B-frames, no
             # CABAC), the profile cheap hardware decoders handle reliably — main/high B-frames make
-            # some dongles show frame 1 then freeze. Cap to 720p, keyframe every ~2s.
+            # some dongles show frame 1 then freeze. Keyframe every ~2s.
+            level = '4.0' if max_width > 1280 else '3.1'   # 4.0 needed for 1080p
+            maxrate = '10M' if max_width > 1280 else '6M'
             cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-                    '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
-                    '-vf', "scale='min(1280,iw)':-2", '-g', '48', '-bf', '0',
-                    '-maxrate', '6M', '-bufsize', '12M']
+                    '-profile:v', 'baseline', '-level', level, '-pix_fmt', 'yuv420p',
+                    '-vf', f"scale='min({max_width},iw)':-2", '-g', '48', '-bf', '0',
+                    '-maxrate', maxrate, '-bufsize', '20M']
         else:
             cmd += ['-c:v', 'copy']   # progressive H.264 (YouTube etc.) — copy is fine and fast
         cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
