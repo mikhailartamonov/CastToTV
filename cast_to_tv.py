@@ -626,6 +626,7 @@ class YoutubeStreamer:
         self.thread = None
         self._done = False        # ffmpeg finished muxing
         self._completed = False   # a client has streamed the file to EOF (→ don't replay)
+        self._served = 0          # high-water byte a client has been served (resume reconnects here)
         self._is_hls = False      # source is HLS (m3u8) → re-encode video, don't copy
         # Declared byte length for the served stream (0 = unknown/live). When non-zero we send a
         # Content-Length + OP=01 so the renderer shows a real total time instead of 00:00:00.
@@ -694,7 +695,9 @@ class YoutubeStreamer:
                 cmd += ['-headers', others]
             if seek_seconds:
                 cmd += ['-ss', str(int(seek_seconds))]   # per-input seek keeps A/V aligned
-            cmd += ['-i', su]
+            cmd += ['-re']                               # pace muxing to realtime — don't race a
+            cmd += ['-i', su]                            # huge backlog ahead that a cheap dongle
+                                                         # would gulp on reconnect and choke on
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
         remaining = max(1, self.duration_seconds - int(seek_seconds)) if self.duration_seconds else 0
@@ -801,29 +804,40 @@ class YoutubeStreamer:
                     time.sleep(5)
                     return
                 limit = streamer.content_length   # 0 = unbounded; else never send past the declared length
-                sent = 0
+                # Resume from the live edge, NOT byte 0. A cheap dongle drops and reopens the
+                # connection mid-stream; re-serving the whole multi-hundred-MB growing file from
+                # the start floods its tiny buffer and crashes it. Pick up where delivery left off.
+                pos = streamer._served
+                sent = 0                           # bytes delivered THIS connection (anti-storm)
                 stall = 0
                 try:
                     with open(streamer.path, 'rb') as f:   # tail the growing file
+                        f.seek(pos)
                         while stall < 200:
-                            if limit and sent >= limit:
+                            if limit and pos >= limit:
                                 break
                             chunk = f.read(64 * 1024)
                             if chunk:
-                                if limit and sent + len(chunk) > limit:
-                                    chunk = chunk[:limit - sent]
+                                if limit and pos + len(chunk) > limit:
+                                    chunk = chunk[:limit - pos]
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
+                                pos += len(chunk)
                                 sent += len(chunk)
+                                if pos > streamer._served:
+                                    streamer._served = pos
                                 stall = 0
                             elif streamer._done:
                                 chunk = f.read(64 * 1024)   # final drain after ffmpeg exit
                                 if chunk:
-                                    if limit and sent + len(chunk) > limit:
-                                        chunk = chunk[:limit - sent]
+                                    if limit and pos + len(chunk) > limit:
+                                        chunk = chunk[:limit - pos]
                                     self.wfile.write(chunk)
                                     self.wfile.flush()
+                                    pos += len(chunk)
                                     sent += len(chunk)
+                                    if pos > streamer._served:
+                                        streamer._served = pos
                                     continue
                                 streamer._completed = True  # reached true EOF — don't replay
                                 break
