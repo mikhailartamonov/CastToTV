@@ -295,6 +295,7 @@ class DongleCaster:
                 self.send_header('contentFeatures.dlna.org',
                                  'DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000')
                 self.end_headers()
+                t0 = time.time()
                 pos = 0
                 stall = 0
                 try:
@@ -317,6 +318,9 @@ class DongleCaster:
                             stall += 1
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     pass
+                # Anti-storm: don't let a near-empty request return instantly (dongle reconnect loop).
+                if pos < 64 * 1024 and time.time() - t0 < 3:
+                    time.sleep(5)
 
             def do_HEAD(self):
                 self.send_response(200)
@@ -779,9 +783,14 @@ class YoutubeStreamer:
 
             def do_GET(self):
                 self._hdr()
-                # Play-once: once the whole file has been streamed to a client, a DLNA dongle
-                # that re-requests the URL on EOF would otherwise loop. Serve nothing so it stops.
+                t0 = time.time()
+                # Play-once: once the file has been streamed to EOF, a cheap DLNA dongle re-requests
+                # the URL to loop. Answering with an INSTANT empty 200 makes it hammer us ~60×/s, and
+                # that request storm crashes its tiny firmware off the network. HOLD the connection a
+                # few seconds instead of returning instantly — the dongle can't storm and just sits at
+                # the end. (This was the root cause of the dongle "freezing".)
                 if streamer._completed:
+                    time.sleep(8)
                     return
                 # ffmpeg may not have created the file yet on a very early connect — wait briefly.
                 waited = 0
@@ -789,6 +798,7 @@ class YoutubeStreamer:
                     time.sleep(0.1)
                     waited += 1
                 if not os.path.exists(streamer.path):
+                    time.sleep(5)
                     return
                 limit = streamer.content_length   # 0 = unbounded; else never send past the declared length
                 sent = 0
@@ -822,6 +832,10 @@ class YoutubeStreamer:
                                 stall += 1
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     pass
+                # Anti-storm safety net: never let a request that delivered almost nothing return
+                # instantly — pad it so a reconnect-happy dongle can't spin a 60×/s loop on us.
+                if sent < 64 * 1024 and time.time() - t0 < 3:
+                    time.sleep(5)
 
             def log_message(self, *a):
                 _file_log(f"[YT-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
@@ -1099,6 +1113,8 @@ class RadioStreamer:
 
             def do_GET(self):
                 self._hdr()
+                t0 = time.time()
+                sent = 0
                 stall = 0
                 try:
                     with open(streamer.path, 'rb') as f:
@@ -1107,12 +1123,16 @@ class RadioStreamer:
                             if chunk:
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
+                                sent += len(chunk)
                                 stall = 0
                             else:
                                 time.sleep(0.1)
                                 stall += 1
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     pass
+                # Anti-storm: don't let a near-empty request return instantly (dongle reconnect loop).
+                if sent < 64 * 1024 and time.time() - t0 < 3:
+                    time.sleep(5)
 
             def log_message(self, *a):
                 _file_log(f"[RADIO-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
