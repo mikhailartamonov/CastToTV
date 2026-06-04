@@ -78,6 +78,22 @@ def resolve_binary(name):
     return found
 
 
+def _pdeathsig_preexec():
+    """Ask the kernel to SIGKILL this child the moment its parent dies (Linux PR_SET_PDEATHSIG).
+
+    Without this, a crashed or force-killed app leaves an orphaned ffmpeg muxing into a temp
+    file forever. With it, ffmpeg can't outlive the app no matter how the app goes down.
+    """
+    try:
+        import ctypes, signal as _sig
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _sig.SIGKILL)  # PR_SET_PDEATHSIG=1
+    except Exception:
+        pass
+
+# preexec_fn is POSIX-only and pdeathsig is Linux-only; None elsewhere (no-op on Windows/macOS).
+_PREEXEC = _pdeathsig_preexec if sys.platform.startswith('linux') else None
+
+
 # ============= TRANSCODER =============
 
 def check_ffmpeg():
@@ -238,7 +254,8 @@ class DongleCaster:
 
         if callback:
             callback("[FFMPEG] Buffering...")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     preexec_fn=_PREEXEC)
 
         def reader():
             while self.proc and self.proc.poll() is None:
@@ -670,7 +687,8 @@ class YoutubeStreamer:
         self.callback("[YT] Muxing stream to disk (ffmpeg)...")
         self._errlog = os.path.join(self._dir, 'ffmpeg.log')
         errf = open(self._errlog, 'w')
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf,
+                                     preexec_fn=_PREEXEC)
         proc = self.proc   # local ref: stop() may null self.proc while _wait runs
 
         def _wait():
