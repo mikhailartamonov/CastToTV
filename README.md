@@ -28,12 +28,7 @@
 [![protocols](https://img.shields.io/badge/protocols-DLNA%20%7C%20Chromecast%20%7C%20AirPlay-blueviolet)]()
 [![sources](https://img.shields.io/badge/sources-files%20%7C%20YouTube%20%7C%20Rutube%20%7C%20VK%20%7C%20any%20site%20%7C%20radio-9cf)]()
 
-![CastToTV on Linux](docs/images/main-linux.png)
-
-*One `< DISCOVER >` sweeps DLNA (SSDP + /24 scan), Chromecast (mDNS) and
-AirPlay (mDNS) and merges everything into one protocol-tagged dropdown:*
-
-![Multi-protocol discovery on Linux](docs/images/devices-linux.png)
+> _Screenshots coming with the first binary release._
 
 ## What it does
 
@@ -272,12 +267,12 @@ install.
 
 ```
 .
-├── cast_to_tv.py     main app: Tk GUI + HTTP server + DLNA/Chromecast/AirPlay
-├── CastToTV.spec     PyInstaller spec
-├── build.bat         Windows build
-├── docs/images/      screenshots (Linux + Windows)
-├── legacy/           January prototypes — pre-repo origin (vendored dlnap, MIT)
-└── .github/workflows/ tag-driven builds
+├── cast_to_tv.py        main app: Tk GUI + HTTP server + DLNA/Chromecast/AirPlay/radio
+├── CastToTV.spec        PyInstaller spec (Windows)
+├── CastToTV-linux.spec  PyInstaller spec (Ubuntu one-file, ffmpeg+yt-dlp bundled)
+├── build.bat            Windows build
+├── legacy/              January prototypes — pre-repo origin (vendored dlnap, MIT)
+└── .github/workflows/   tag-driven builds
 ```
 
 ## Roadmap
