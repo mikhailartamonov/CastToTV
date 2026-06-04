@@ -307,9 +307,3 @@ install.
 
 `legacy/dlnap.py` is by Pavel Cherezov, also MIT, copied verbatim from
 [cherezov/dlnap](https://github.com/cherezov/dlnap).
-
----
-
-<sub>Windows screenshots (the original `D3x`-era UI) are kept in
-`docs/images/` for reference; the Linux build above is the current look.</sub>
-</content>
