@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 datas, binaries, hiddenimports = [], [], []
 
 # Pull in the optional cast backends and their dynamic submodules / data files.
-for pkg in ('pychromecast', 'pyatv', 'zeroconf', 'aiohttp', 'cryptography', 'miniaudio'):
+for pkg in ('pychromecast', 'pyatv', 'zeroconf', 'aiohttp', 'cryptography', 'miniaudio', 'PIL'):
     try:
         d, b, h = collect_all(pkg)
         datas += d
