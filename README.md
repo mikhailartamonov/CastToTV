@@ -13,19 +13,20 @@
 ╚════════════════════════════════════════════════════════╝
 ```
 
-> Cast a video, a YouTube/Rutube link, or music to **any** screen and
-> speaker in your home — a DLNA TV, an HDMI dongle, a Chromecast, an
-> Apple TV — and fan the **same** stream out to every room at once so you
-> can walk around the house and keep hearing (and seeing) what's playing.
-> One single-file Python app, keygen-2005 styling, ffmpeg + yt-dlp under
-> the hood, no installation.
+> Cast a video, a YouTube / Rutube / VK link (or any site yt-dlp knows),
+> music, or an internet radio station — with the current track's cover art
+> on screen — to **any** display and speaker in your home: a DLNA TV, an
+> HDMI dongle, a Chromecast, an Apple TV. Fan the **same** stream out to
+> every room at once so you can walk around the house and keep hearing (and
+> seeing) what's playing. One single-file Python app, keygen-2005 styling,
+> ffmpeg + yt-dlp under the hood, no installation.
 
 [![python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![status](https://img.shields.io/badge/status-v0.6.0--beta-orange)]()
 [![protocols](https://img.shields.io/badge/protocols-DLNA%20%7C%20Chromecast%20%7C%20AirPlay-blueviolet)]()
-[![sources](https://img.shields.io/badge/sources-files%20%7C%20YouTube%20%7C%20Rutube%20%7C%20music-9cf)]()
+[![sources](https://img.shields.io/badge/sources-files%20%7C%20YouTube%20%7C%20Rutube%20%7C%20VK%20%7C%20any%20site%20%7C%20radio-9cf)]()
 
 ![CastToTV on Linux](docs/images/main-linux.png)
 
@@ -51,8 +52,14 @@ how it's reached:
 
 - **Local files** in almost any format — H.264/HEVC, MKV/MP4, with
   on-the-fly AC3/DTS→AAC transcoding when the renderer is picky.
-- **YouTube and Rutube** links (and anything else yt-dlp resolves) —
-  paste the URL into the `[FILE]` field.
+- **YouTube, Rutube, VK — and basically any site** yt-dlp can handle
+  (its site extractors plus the generic fallback cover hundreds of players;
+  paste the page URL into the `[FILE]` field). Web sources are re-encoded to
+  dongle-safe baseline H.264 on the fly, so cheap sticks never choke.
+- **Internet radio with cover art** — paste a `dnbradio.com/?channel=…`
+  link and the station plays with the current track's art as a full-screen
+  (stretched-and-blurred) background, the sharp cover centred, and the
+  track / artist / station text on top — all updating live as tracks change.
 - **Music** — same pipeline, audio MIME.
 
 ## TL;DR
@@ -60,12 +67,12 @@ how it's reached:
 ```bash
 git clone https://github.com/mikhailartamonov/CastToTV.git && cd CastToTV
 
-# Lite — DLNA + YouTube/Rutube only, just needs ffmpeg + yt-dlp on PATH:
+# Lite — DLNA + web video (YouTube/Rutube/VK/…), needs ffmpeg + yt-dlp on PATH:
 python cast_to_tv.py
 
-# Full — adds Chromecast + AirPlay (one-time venv with the extra deps):
+# Full — adds Chromecast + AirPlay + radio cover art (one-time venv):
 python3 -m venv --system-site-packages .venv
-.venv/bin/python -m pip install pychromecast pyatv
+.venv/bin/python -m pip install pychromecast pyatv Pillow
 .venv/bin/python cast_to_tv.py
 ```
 
@@ -236,18 +243,19 @@ the alias to the real path, and the Russian title still shows via DIDL.
 
 ## Standalone binaries
 
-The goal is a self-contained download with **ffmpeg and yt-dlp bundled
-inside** — no system dependencies — for:
+A self-contained download with **ffmpeg and yt-dlp bundled inside** — no
+system dependencies:
 
-- **Windows** — PyInstaller one-file `.exe`.
-- **Ubuntu** (priority) — PyInstaller one-file, static ffmpeg + `yt-dlp`
-  bundled; runs on a clean machine with nothing installed.
-- **Arch Linux** — same one-file build, or a `PKGBUILD` using Arch's
-  system `ffmpeg`/`yt-dlp`.
+- **Ubuntu** ✅ — `pyinstaller CastToTV-linux.spec` produces a ~124 MB
+  one-file binary with a static ffmpeg/ffprobe + `yt-dlp` and the
+  Chromecast/AirPlay/Pillow deps inside; runs on a clean machine (verified
+  launching with an empty `PATH`).
+- **Windows / Arch** — same approach, built on their own hosts (CI matrix
+  planned).
 
 `resolve_binary()` finds bundled helpers (`sys._MEIPASS`) first and falls
 back to `PATH`, so the *same* code powers both the fat bundle and a "lite"
-install. *(Build scripts land with Phase 6 — see Roadmap.)*
+install.
 
 ## Requirements
 
@@ -255,8 +263,9 @@ install. *(Build scripts land with Phase 6 — see Roadmap.)*
 - **ffmpeg / ffprobe** and **yt-dlp** — on `PATH` for the lite run, or
   bundled in the standalone binaries. Without ffmpeg the app still serves
   plain H.264/AAC files directly.
-- **`pychromecast`, `pyatv`** — only for Chromecast / AirPlay (installed
-  into a project `.venv`; the app runs DLNA-only without them).
+- **`pychromecast`, `pyatv`, `Pillow`** — optional, for Chromecast / AirPlay
+  and the radio cover-art visual (installed into a project `.venv`; the app
+  runs DLNA + web video without them).
 - **Same `/24` as the receivers**, no client isolation.
 
 ## Project layout
@@ -278,15 +287,19 @@ install. *(Build scripts land with Phase 6 — see Roadmap.)*
 - [x] AC3/DTS → AAC auto-transcode; dongle MPEG-TS mode
 - [x] ASCII URL aliasing, UPnP `716`/`701` recovery, subtitle BOM
 - [x] **Rebrand to CastToTV; cross-platform UI (Consolas → mono on Linux)**
-- [x] **YouTube + Rutube via yt-dlp → ffmpeg → growing-file stream**
+- [x] **YouTube / Rutube / VK / any yt-dlp site → ffmpeg → growing-file stream**
+- [x] **Always re-encode web sources to dongle-safe baseline H.264 (AV1/HLS/headers fixed)**
 - [x] **`MediaSource` / `play_on` cast abstraction**
 - [x] **Chromecast backend (pychromecast)**
 - [x] **AirPlay backend (pyatv)**
 - [x] **Multi-room `[MULTI]` cast — `cast_to_all` barrier, best-effort sync**
-- [ ] Standalone bundled binaries (Windows / Ubuntu / Arch)
-- [ ] Miracast helper integration
+- [x] **Internet-radio mode with live cover-art visual (AzuraCast stations)**
+- [x] **Never-orphan ffmpeg (`PR_SET_PDEATHSIG`)**
+- [x] **Standalone Ubuntu binary with ffmpeg + yt-dlp bundled**
+- [ ] [Standalone binaries for Windows / Arch (CI matrix)](https://github.com/mikhailartamonov/CastToTV/issues/3)
+- [ ] [Miracast helper integration](https://github.com/mikhailartamonov/CastToTV/issues/4)
+- [ ] [Headless / CLI mode](https://github.com/mikhailartamonov/CastToTV/issues/5)
 - [ ] [Stream from magnet / torrent](https://github.com/mikhailartamonov/CastToTV/issues/1)
-- [ ] Headless / CLI mode
 
 ## License
 
