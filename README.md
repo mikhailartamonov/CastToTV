@@ -293,7 +293,10 @@ install.
 - [x] **Standalone Ubuntu binary with ffmpeg + yt-dlp bundled**
 - [ ] [Standalone binaries for Windows / Arch (CI matrix)](https://github.com/mikhailartamonov/CastToTV/issues/3)
 - [ ] [Miracast helper integration](https://github.com/mikhailartamonov/CastToTV/issues/4)
+- [ ] [Headless `CastingController` / engine API — web + mobile foundation](https://github.com/mikhailartamonov/CastToTV/issues/6)
 - [ ] [Headless / CLI mode](https://github.com/mikhailartamonov/CastToTV/issues/5)
+- [ ] [Web app — public frontend + local agent](https://github.com/mikhailartamonov/CastToTV/issues/7)
+- [ ] [Android app (APK) — phone as the caster](https://github.com/mikhailartamonov/CastToTV/issues/8)
 - [ ] [Stream from magnet / torrent](https://github.com/mikhailartamonov/CastToTV/issues/1)
 
 ## License
