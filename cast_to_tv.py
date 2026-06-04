@@ -695,9 +695,12 @@ class YoutubeStreamer:
                 cmd += ['-headers', others]
             if seek_seconds:
                 cmd += ['-ss', str(int(seek_seconds))]   # per-input seek keeps A/V aligned
-            cmd += ['-re']                               # pace muxing to realtime — don't race a
-            cmd += ['-i', su]                            # huge backlog ahead that a cheap dongle
-                                                         # would gulp on reconnect and choke on
+            # Let the dongle fill its buffer with a ~30s initial burst, then hold realtime. Plain
+            # -re (==readrate 1.0, no burst) is too tight: the dongle never gets ahead and sits on a
+            # "buffering" spinner. The burst gives headroom; realtime afterwards keeps the on-disk
+            # backlog small (~30s ≈ 15 MB) so a reconnect has little to re-gulp. Needs ffmpeg ≥7.0.
+            cmd += ['-readrate', '1.0', '-readrate_initial_burst', '30']
+            cmd += ['-i', su]
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
         remaining = max(1, self.duration_seconds - int(seek_seconds)) if self.duration_seconds else 0
