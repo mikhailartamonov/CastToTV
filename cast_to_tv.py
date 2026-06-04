@@ -695,19 +695,16 @@ class YoutubeStreamer:
         # (DLNA.ORG_OP=10) rather than a byte Content-Length — that's how Rygel/UMS make a
         # transcoded stream of unknown size show its duration without muxing the whole thing.
         self.play_seconds = remaining
-        if self._is_hls:
-            # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities → dongles
-            # freeze at segment joins. Re-encode to clean H.264. Use *baseline* (no B-frames, no
-            # CABAC), the profile cheap hardware decoders handle reliably — main/high B-frames make
-            # some dongles show frame 1 then freeze. Keyframe every ~2s.
-            level = '4.0' if max_width > 1280 else '3.1'   # 4.0 needed for 1080p
-            maxrate = '10M' if max_width > 1280 else '6M'
-            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-                    '-profile:v', 'baseline', '-level', level, '-pix_fmt', 'yuv420p',
-                    '-vf', f"scale='min({max_width},iw)':-2", '-g', '48', '-bf', '0',
-                    '-maxrate', maxrate, '-bufsize', '20M']
-        else:
-            cmd += ['-c:v', 'copy']   # progressive H.264 (YouTube etc.) — copy is fine and fast
+        # ALWAYS re-encode video to a clean *baseline* H.264 (no B-frames, no CABAC) — never hand a
+        # cheap dongle the source stream as-is (`-c:v copy`). Source streams (VK/OK high-profile
+        # H.264, HLS with segment-join discontinuities) make dongles freeze or show audio-only; a
+        # re-encoded baseline stream is what every hardware decoder handles. Keyframe every ~2s.
+        level = '4.0' if max_width > 1280 else '3.1'   # 4.0 needed for 1080p
+        maxrate = '10M' if max_width > 1280 else '6M'
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+                '-profile:v', 'baseline', '-level', level, '-pix_fmt', 'yuv420p',
+                '-vf', f"scale='min({max_width},iw)':-2", '-g', '48', '-bf', '0',
+                '-maxrate', maxrate, '-bufsize', '20M']
         cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
         self.callback("[YT] Muxing stream to disk (ffmpeg)...")
         self._errlog = os.path.join(self._dir, 'ffmpeg.log')
