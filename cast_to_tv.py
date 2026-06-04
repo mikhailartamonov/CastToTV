@@ -1946,6 +1946,9 @@ class KeygenApp:
         self.current_cast = None
         self._current_file = None
         self._seek_pos = 0
+        self._last_pos = 0         # last polled RelTime — RESUME recovers from here after a freeze
+        self._cast_source = None   # the input string of the current cast, so RESUME can re-cast it
+        self._pos_track_gen = 0    # bumps to retire the previous position-tracker thread
         self.http_server = None
         self.dongle_caster = None
         self.youtube_streamer = None
@@ -2110,6 +2113,11 @@ class KeygenApp:
         self.pause_btn.pack(side='left', padx=5)
         tk.Button(btn2, text="< STOP >", font=(MONO, 10, "bold"), fg='#000', bg='#AA0000',
             command=self.do_stop, width=10, bd=3).pack(side='left', padx=5)
+        # RESUME = re-establish the cast from the last tracked position. Unlike PAUSE/unpause this
+        # rebuilds the whole stream, so it recovers after a dongle freeze/crash where the transport
+        # is dead and a plain Resume can't help.
+        tk.Button(btn2, text="⟲ RESUME", font=(MONO, 10, "bold"), fg='#000', bg='#00AA66',
+            command=self.do_resume, width=11, bd=3).pack(side='left', padx=5)
 
         # Seek buttons
         seek_frame = tk.Frame(frame, bg='#000000')
@@ -2391,6 +2399,38 @@ class KeygenApp:
                 self.log(f"[ERR] Pause/Resume failed: {e}")
         threading.Thread(target=run, daemon=True).start()
 
+    def _track_position(self):
+        """Poll the renderer's RelTime in the background so RESUME knows where to pick up after a
+        freeze/crash. Each cast bumps _pos_track_gen, which retires any older tracker thread."""
+        gen = self._pos_track_gen
+        ctrl = self.discovered_device and self.discovered_device.get('control_url')
+        if not ctrl:
+            return
+        while gen == self._pos_track_gen:
+            try:
+                pos, _ = get_position(ctrl)
+                if pos and pos > 0:
+                    self._last_pos = pos
+            except Exception:
+                pass        # a wedged dongle stops answering — keep the last good _last_pos
+            time.sleep(5)
+
+    def do_resume(self):
+        """Re-establish the current cast from the last tracked position. Recovers playback after a
+        dongle freeze/crash (where the stream died and plain Pause/Resume is useless)."""
+        if not self._cast_source:
+            self.log("[RESUME] Nothing to resume yet — cast something first")
+            return
+        if not self.discovered_device:
+            self.log("[RESUME] No TV — click DISCOVER first")
+            return
+        at = int(self._last_pos)
+        self.log(f"[RESUME] Re-casting '{self._cast_source[:50]}' from {format_duration(at)}")
+        # Put the remembered source back in the field so do_cast picks it up, then re-cast with seek.
+        self.file_entry.delete(0, 'end')
+        self.file_entry.insert(0, self._cast_source)
+        self.do_cast(resume_at=at)
+
     def do_stop(self):
         if not self.discovered_device:
             self.log("[ERR] No TV discovered — click DISCOVER first")
@@ -2520,7 +2560,7 @@ class KeygenApp:
         except Exception as e:
             return False, f"Chromecast error: {type(e).__name__}: {e}"
 
-    def do_cast(self):
+    def do_cast(self, resume_at=0):
         video = self.file_entry.get().strip()
         subs = self.sub_entry.get().strip()
 
@@ -2532,6 +2572,10 @@ class KeygenApp:
             return
 
         control = self.discovered_device['control_url']
+        self._cast_source = video          # remember it so RESUME can re-cast from _last_pos
+        self._pos_track_gen += 1           # retire any position tracker from a previous cast
+        if not resume_at:
+            self._last_pos = 0             # fresh cast (not a resume) — reset the saved position
 
         def run():
             sub_url = None
@@ -2575,7 +2619,7 @@ class KeygenApp:
                     return
                 self.log(f"[YT] {streamer.title or 'stream'} — {streamer.duration or 'unknown'}")
                 local = get_local_ip()
-                streamer.start(stream_urls)
+                streamer.start(stream_urls, seek_seconds=resume_at)   # RESUME bakes the offset in
                 streamer.wait_prefill()
                 url = f"http://{local}:{self.server_port + 2}/stream.ts"
                 name = streamer.title or 'Stream'
@@ -2738,12 +2782,23 @@ class KeygenApp:
                 self.log("[OK] Streaming started!")
                 if sub_url:
                     self.log("[OK] Subtitles attached")
+                # Resuming a direct file/URL: the seek isn't baked into the stream (only the
+                # extractable yt-dlp path does that), so ask the renderer to seek natively.
+                if resume_at and not is_extractable_url(video) and not is_radio_url(video):
+                    try:
+                        seek_to(control, format_duration(int(resume_at)), callback=self.log)
+                        self.log(f"[RESUME] Seeked TV to {format_duration(int(resume_at))}")
+                    except Exception as e:
+                        self.log(f"[RESUME] native seek failed: {e}")
                 self.status_lbl.config(text="PLAYING", fg='#00FF00')
                 self.paused = False
                 self.root.after(0, lambda: self.pause_btn.config(text="< PAUSE >"))
                 self.current_cast = name
                 display_name = name[:50] + "..." if len(name) > 50 else name
                 self.now_playing.config(text=f"[NOW] {display_name}", fg='#00FF00')
+                # Track playback position so RESUME can recover the spot after a freeze/crash.
+                # (gen was already bumped in do_cast, retiring any previous tracker.)
+                threading.Thread(target=self._track_position, daemon=True).start()
             else:
                 self.log(f"[ERR] {msg}")
                 self.status_lbl.config(text="FAILED", fg='#FF0000')
