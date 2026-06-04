@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-D3x LG WebOS TV CASTER v0.4.4-beta - DLNA Video Streaming Tool
-KeyGen 2005 Style Interface with MUSIC!
+CastToTV — cast video, YouTube/Rutube and music to every screen and speaker in your home.
+
+A single-file, multi-protocol media caster. It discovers DLNA/UPnP renderers (smart TVs,
+HDMI dongles), Chromecast and AirPlay receivers on the LAN, then streams:
+  * local files in almost any format (transcoded on the fly when a renderer is picky),
+  * YouTube / Rutube links (resolved via yt-dlp),
+  * music tracks,
+to a single room — or fans the very same stream out to many rooms at once for
+near-synchronous, walk-around-the-house playback.
+
+KeyGen-2005-style Tkinter interface, ffmpeg/yt-dlp powered.
 """
 
-VERSION = "0.5.0-beta"
+VERSION = "0.6.0-beta"
 DEBUG_VERBOSE = True  # set False to silence [DBG] lines
 
 # Module-level file logger so non-GUI helpers (HTTP handler, SOAP) can log
@@ -40,14 +49,56 @@ import subprocess
 import json
 import concurrent.futures
 import functools
+import shutil
 
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cast_log.txt')
+
+# ============= BUNDLED-BINARY RESOLVER =============
+
+_BINARY_CACHE = {}
+
+def resolve_binary(name):
+    """Locate a helper binary (ffmpeg/ffprobe/yt-dlp): bundled-first, then system PATH.
+
+    In a PyInstaller build the helpers are unpacked next to the app (sys._MEIPASS or the
+    executable dir), so the fat binary is fully self-contained. In a plain checkout we fall
+    back to whatever is on PATH, which is exactly what a 'lite' install wants. Cached per name.
+    """
+    cached = _BINARY_CACHE.get(name)
+    if cached:
+        return cached
+    exe = name + ('.exe' if os.name == 'nt' else '')
+    if getattr(sys, 'frozen', False):
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(base, exe)
+    found = bundled if os.path.exists(bundled) else (shutil.which(name) or name)
+    _BINARY_CACHE[name] = found
+    return found
+
+
+def _pdeathsig_preexec():
+    """Ask the kernel to SIGKILL this child the moment its parent dies (Linux PR_SET_PDEATHSIG).
+
+    Without this, a crashed or force-killed app leaves an orphaned ffmpeg muxing into a temp
+    file forever. With it, ffmpeg can't outlive the app no matter how the app goes down.
+    """
+    try:
+        import ctypes, signal as _sig
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _sig.SIGKILL)  # PR_SET_PDEATHSIG=1
+    except Exception:
+        pass
+
+# preexec_fn is POSIX-only and pdeathsig is Linux-only; None elsewhere (no-op on Windows/macOS).
+_PREEXEC = _pdeathsig_preexec if sys.platform.startswith('linux') else None
+
 
 # ============= TRANSCODER =============
 
 def check_ffmpeg():
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        subprocess.run([resolve_binary('ffmpeg'), '-version'], capture_output=True, timeout=5)
         return True
     except Exception:
         return False
@@ -60,7 +111,7 @@ def probe_file(filepath):
         return {}, 0, 0
     try:
         result = subprocess.run([
-            'ffprobe', '-v', 'error',
+            resolve_binary('ffprobe'), '-v', 'error',
             '-show_entries', 'stream=codec_name,codec_type',
             '-show_entries', 'format=bit_rate,duration',
             '-of', 'json', filepath
@@ -96,6 +147,73 @@ def format_duration(seconds):
 import http.server
 import socketserver
 
+# Optional cast backends. Imported lazily-guarded so a DLNA-only ("lite") install — or a run
+# under a Python without these deps — still works; the extra protocols just go unavailable.
+try:
+    import pychromecast
+    HAS_CHROMECAST = True
+except Exception:
+    HAS_CHROMECAST = False
+
+try:
+    import asyncio
+    import pyatv
+    HAS_AIRPLAY = True
+except Exception:
+    HAS_AIRPLAY = False
+
+try:
+    from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageOps
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+
+def discover_chromecasts(timeout=4):
+    """Blocking Chromecast scan. Returns (cast_objects, browser); each cast exposes
+    .cast_info with friendly_name / host / port / uuid. Caller keeps the browser alive."""
+    if not HAS_CHROMECAST:
+        return [], None
+    return pychromecast.get_chromecasts(timeout=timeout)
+
+
+class _AsyncLoop:
+    """A background asyncio event loop so pyatv's coroutines can be driven from the Tk thread.
+
+    pyatv is asyncio-only; the rest of the app is thread-based. We run one private loop in a
+    daemon thread and submit coroutines to it via run_coroutine_threadsafe.
+    """
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run(self, coro, timeout=None):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def submit(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def stop(self):
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+
+
+def discover_airplay(aloop, timeout=4):
+    """Scan for AirPlay / Apple TV receivers. Returns a list of pyatv configs (each has
+    .name / .address / .identifier). Runs on the shared async loop."""
+    if not HAS_AIRPLAY:
+        return []
+    async def _scan():
+        return await pyatv.scan(aloop.loop, timeout=timeout)
+    return aloop.run(_scan(), timeout=timeout + 6)
+
 
 class DongleCaster:
     """ffmpeg → MPEG-TS → memory buffer → HTTP, for dongles/old TVs without Range.
@@ -126,7 +244,7 @@ class DongleCaster:
         bad_audio = acodec in ('ac3', 'eac3', 'dts', 'dca', 'truehd', 'mlp')
         self.duration = format_duration(duration) if duration else None
 
-        cmd = ['ffmpeg']
+        cmd = [resolve_binary('ffmpeg')]
         if seek:
             cmd += ['-ss', seek]
         cmd += ['-i', filepath, '-c:v', 'copy']
@@ -142,7 +260,8 @@ class DongleCaster:
 
         if callback:
             callback("[FFMPEG] Buffering...")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     preexec_fn=_PREEXEC)
 
         def reader():
             while self.proc and self.proc.poll() is None:
@@ -180,11 +299,12 @@ class DongleCaster:
                 stall = 0
                 try:
                     while stall < 100:
+                        # Snapshot length AND slice the bytes under a single lock so a
+                        # concurrent stop()/reset can't leave `pos` past the buffer end.
                         with caster.lock:
-                            avail = len(caster.buf) - pos
-                        if avail > 0:
-                            with caster.lock:
-                                chunk = bytes(caster.buf[pos:pos + 64 * 1024])
+                            buflen = len(caster.buf)
+                            chunk = bytes(caster.buf[pos:pos + 64 * 1024]) if buflen > pos else b''
+                        if chunk:
                             self.wfile.write(chunk)
                             self.wfile.flush()
                             pos += len(chunk)
@@ -291,10 +411,12 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Serves ONLY the registered video + optional subtitle for this cast. Anything else → 404."""
 
     def __init__(self, *args, video_path=None, subtitle_path=None, subtitle_url=None,
-                 video_url_name=None, subtitle_url_name=None, **kwargs):
+                 video_url_name=None, subtitle_url_name=None,
+                 total_size=0, **kwargs):
         self.video_path = video_path
         self.subtitle_path = subtitle_path
         self.subtitle_url = subtitle_url
+        self.total_size = total_size  # non-zero → growing file mode (yt stream)
         # URL-served names — may be ASCII aliases to dodge DMR quirks with Cyrillic/spaces/etc
         self.video_url_name = video_url_name or (os.path.basename(video_path) if video_path else None)
         self.subtitle_url_name = subtitle_url_name or (os.path.basename(subtitle_path) if subtitle_path else None)
@@ -340,7 +462,7 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
             return None
 
         fs = os.fstat(f.fileno())
-        file_size = fs.st_size
+        file_size = self.total_size if self.total_size else fs.st_size
 
         if range_header and range_header != '-':
             match = re.match(r'bytes=(\d*)-(\d*)', range_header)
@@ -353,6 +475,15 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_error(416, 'Range Not Satisfiable')
                     return None
                 end = min(end, file_size - 1)
+                # Growing file: wait until enough data is downloaded
+                if self.total_size:
+                    deadline = time.time() + 60
+                    while time.time() < deadline:
+                        current = os.fstat(f.fileno()).st_size
+                        if current > start:
+                            end = min(end, current - 1)
+                            break
+                        time.sleep(0.3)
                 length = end - start + 1
                 self.send_response(206)
                 self.send_header('Content-Type', ctype)
@@ -444,15 +575,590 @@ class SilentThreadingTCPServer(socketserver.ThreadingTCPServer):
         else:
             super().handle_error(request, client_address)
 
+# A direct media file we serve as-is; anything else that's a web page goes through yt-dlp.
+_DIRECT_MEDIA_EXT = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv',
+                     '.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg')
+
+def is_extractable_url(text):
+    """True for a page URL yt-dlp should resolve. Any http(s) page that isn't a direct media
+    file is handed to yt-dlp — its site extractors plus the generic fallback cover a huge range
+    of sites (YouTube, Rutube, VK, and arbitrary players like freehat.cc), and the result is
+    always re-encoded, so the renderer gets a safe stream rather than a raw page URL."""
+    if not text or not text.startswith(('http://', 'https://')):
+        return False
+    path = text.split('?', 1)[0].split('#', 1)[0].lower()
+    return not path.endswith(_DIRECT_MEDIA_EXT)
+
+# Back-compat alias for older call sites.
+is_youtube_url = is_extractable_url
+
+
+class YoutubeStreamer:
+    """Resolve a YouTube/Rutube/… URL with a single yt-dlp call, then mux it with ffmpeg into
+    a growing MPEG-TS file on disk and serve that file to one or more renderers.
+
+    Disk-backed (not an in-memory buffer) so multi-hour videos can't OOM the app, and the one
+    growing file can feed every connected renderer — exactly what multi-room fan-out needs.
+    Playback starts a few seconds in; we never wait for the whole download.
+    """
+
+    # Force H.264 (avc1) video, not AV1/VP9: cheap dongles & TVs decode H.264 in hardware but
+    # play AV1 as audio-only (black screen). Cap at 1080p for the same reason.
+    _FORMAT = ('bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]/'
+               'best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best')
+
+    def __init__(self, url, port, callback=None):
+        self.url = url
+        self.port = port
+        self.callback = callback or (lambda m: None)
+        self.total_size = 0      # source filesize (bytes) from yt-dlp, if known
+        self.duration = None     # HH:MM:SS string (full video)
+        self.duration_seconds = 0
+        self.title = None
+        self._dir = None
+        self.path = None         # growing .ts file on disk
+        self.proc = None         # ffmpeg
+        self.srv = None
+        self.thread = None
+        self._done = False        # ffmpeg finished muxing
+        self._completed = False   # a client has streamed the file to EOF (→ don't replay)
+        self._is_hls = False      # source is HLS (m3u8) → re-encode video, don't copy
+        # Declared byte length for the served stream (0 = unknown/live). When non-zero we send a
+        # Content-Length + OP=01 so the renderer shows a real total time instead of 00:00:00.
+        self.content_length = 0
+        self.play_duration = None   # HH:MM:SS the renderer should show (full − seek)
+        self.play_seconds = 0       # same as a float, for the DLNA TimeSeekRange npt header
+        self._headers = []          # per-stream-URL HTTP headers from yt-dlp (User-Agent/Referer)
+        self._error = None
+
+    def _ytdlp(self, *extra):
+        cmd = [resolve_binary('yt-dlp'), '--no-playlist']
+        if 'youtube.com' in self.url or 'youtu.be' in self.url:
+            cmd += ['--extractor-args', 'youtube:player_client=android_vr,web']
+        return cmd + list(extra)
+
+    def probe(self):
+        """One `yt-dlp -J` call → title, duration, approx size, and direct stream URL(s).
+        Returns the URL list (1 = progressive, 2 = separate video+audio) or [] on failure."""
+        try:
+            r = subprocess.run(self._ytdlp('-f', self._FORMAT, '-J', self.url),
+                               capture_output=True, text=True, timeout=60)
+            info = json.loads(r.stdout) if r.stdout.strip() else None
+        except Exception as e:
+            self._error = f'yt-dlp probe failed: {e}'
+            self.callback(f"[YT] {self._error}")
+            return []
+        if not isinstance(info, dict):
+            # yt-dlp returned nothing usable (rate-limited, geo-blocked, extractor error, …)
+            self._error = 'yt-dlp returned no data: ' + ((r.stderr or '').strip()[-200:] or 'empty')
+            self.callback(f"[YT] {self._error}")
+            return []
+        self.title = info.get('title')
+        if info.get('duration'):
+            self.duration_seconds = int(info['duration'])
+            self.duration = format_duration(info['duration'])
+        fmts = [f for f in (info.get('requested_formats') or ([info] if info.get('url') else []))
+                if f.get('url')]
+        urls = [f.get('url') for f in fmts]
+        # Per-format HTTP headers (User-Agent / Referer / …) — some CDNs (VK/OK okcdn.ru) 400 a
+        # plain ffmpeg request, so we replay yt-dlp's headers when opening each input.
+        self._headers = [f.get('http_headers') or {} for f in fmts]
+        self.total_size = sum(int(f.get('filesize') or f.get('filesize_approx') or 0) for f in fmts)
+        self._is_hls = any('m3u8' in (f.get('protocol') or '') or 'hls' in (f.get('protocol') or '')
+                           for f in fmts)
+        if not urls:
+            self._error = 'no playable stream URL'
+            self.callback(f"[YT] {self._error}")
+        return urls
+
+    def start(self, stream_urls, seek_seconds=0, max_width=1280):
+        """Mux the resolved stream URL(s) into a growing MPEG-TS temp file and start serving.
+
+        seek_seconds: start playback this many seconds in (input seek — fast). max_width: cap
+        the re-encoded HLS video width (1280 = 720p default; 1920 = 1080p)."""
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix='casttotv_')
+        self.path = os.path.join(self._dir, 'stream.ts')
+        cmd = [resolve_binary('ffmpeg'), '-loglevel', 'error']
+        for i, su in enumerate(stream_urls):
+            hdr = self._headers[i] if i < len(self._headers) else {}
+            ua = hdr.get('User-Agent')
+            if ua:                                          # CDNs like VK/OK 400 ffmpeg's default UA
+                cmd += ['-user_agent', ua]
+            others = ''.join(f'{k}: {v}\r\n' for k, v in hdr.items() if k.lower() != 'user-agent')
+            if others:
+                cmd += ['-headers', others]
+            if seek_seconds:
+                cmd += ['-ss', str(int(seek_seconds))]   # per-input seek keeps A/V aligned
+            cmd += ['-i', su]
+        if len(stream_urls) == 2:
+            cmd += ['-map', '0:v:0', '-map', '1:a:0']
+        remaining = max(1, self.duration_seconds - int(seek_seconds)) if self.duration_seconds else 0
+        self.play_duration = format_duration(remaining) if remaining else self.duration
+        # The real total time is reported to the renderer via the DLNA TimeSeekRange npt header
+        # (DLNA.ORG_OP=10) rather than a byte Content-Length — that's how Rygel/UMS make a
+        # transcoded stream of unknown size show its duration without muxing the whole thing.
+        self.play_seconds = remaining
+        # ALWAYS re-encode video to a clean *baseline* H.264 (no B-frames, no CABAC) — never hand a
+        # cheap dongle the source stream as-is (`-c:v copy`). Source streams (VK/OK high-profile
+        # H.264, HLS with segment-join discontinuities) make dongles freeze or show audio-only; a
+        # re-encoded baseline stream is what every hardware decoder handles. Keyframe every ~2s.
+        level = '4.0' if max_width > 1280 else '3.1'   # 4.0 needed for 1080p
+        maxrate = '10M' if max_width > 1280 else '6M'
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+                '-profile:v', 'baseline', '-level', level, '-pix_fmt', 'yuv420p',
+                '-vf', f"scale='min({max_width},iw)':-2", '-g', '48', '-bf', '0',
+                '-maxrate', maxrate, '-bufsize', '20M']
+        cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
+        self.callback("[YT] Muxing stream to disk (ffmpeg)...")
+        self._errlog = os.path.join(self._dir, 'ffmpeg.log')
+        errf = open(self._errlog, 'w')
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf,
+                                     preexec_fn=_PREEXEC)
+        proc = self.proc   # local ref: stop() may null self.proc while _wait runs
+
+        def _wait():
+            proc.wait()
+            errf.close()
+            self._done = True
+            if proc.returncode == 0:
+                self.callback("[YT] Source finished")
+            else:
+                tail = ''
+                try:
+                    with open(self._errlog) as f:
+                        tail = f.read().strip().splitlines()[-2:]
+                        tail = ' | '.join(tail)
+                except OSError:
+                    pass
+                self.callback(f"[YT] ffmpeg exit {proc.returncode}: {tail}")
+        threading.Thread(target=_wait, daemon=True).start()
+        self._serve()
+
+    def wait_prefill(self, mb=4, timeout=40):
+        """Block until ~mb MB are on disk so the renderer doesn't catch up to an empty file."""
+        target = mb * 1024 * 1024
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if os.path.getsize(self.path) >= target:
+                    break
+            except OSError:
+                pass
+            if self._done:
+                break
+            time.sleep(0.3)
+        try:
+            self.callback(f"[YT] Buffered {os.path.getsize(self.path)//1024//1024} MB — streaming")
+        except OSError:
+            pass
+
+    def _serve(self):
+        streamer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _hdr(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                op = '00'
+                if streamer.play_seconds:
+                    # DLNA time-seek: report the real duration as the npt range end. This is how a
+                    # transcoded stream of unknown byte size tells the TV its total time (Rygel/UMS
+                    # do the same) — so the TV shows the real total instead of 00:00:00.
+                    dur = f'{streamer.play_seconds:.3f}'
+                    self.send_header('TimeSeekRange.dlna.org', f'npt=0.000-{dur}/{dur}')
+                    self.send_header('X-AvailableSeekRange', f'1 npt=0.000-{dur}')
+                    op = '10'
+                self.send_header('contentFeatures.dlna.org',
+                                 f'DLNA.ORG_OP={op};DLNA.ORG_FLAGS=01700000000000000000000000000000')
+                self.end_headers()
+
+            def do_HEAD(self):
+                self._hdr()
+
+            def do_GET(self):
+                self._hdr()
+                # Play-once: once the whole file has been streamed to a client, a DLNA dongle
+                # that re-requests the URL on EOF would otherwise loop. Serve nothing so it stops.
+                if streamer._completed:
+                    return
+                # ffmpeg may not have created the file yet on a very early connect — wait briefly.
+                waited = 0
+                while not os.path.exists(streamer.path) and waited < 100 and not streamer._done:
+                    time.sleep(0.1)
+                    waited += 1
+                if not os.path.exists(streamer.path):
+                    return
+                limit = streamer.content_length   # 0 = unbounded; else never send past the declared length
+                sent = 0
+                stall = 0
+                try:
+                    with open(streamer.path, 'rb') as f:   # tail the growing file
+                        while stall < 200:
+                            if limit and sent >= limit:
+                                break
+                            chunk = f.read(64 * 1024)
+                            if chunk:
+                                if limit and sent + len(chunk) > limit:
+                                    chunk = chunk[:limit - sent]
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                sent += len(chunk)
+                                stall = 0
+                            elif streamer._done:
+                                chunk = f.read(64 * 1024)   # final drain after ffmpeg exit
+                                if chunk:
+                                    if limit and sent + len(chunk) > limit:
+                                        chunk = chunk[:limit - sent]
+                                    self.wfile.write(chunk)
+                                    self.wfile.flush()
+                                    sent += len(chunk)
+                                    continue
+                                streamer._completed = True  # reached true EOF — don't replay
+                                break
+                            else:
+                                time.sleep(0.1)
+                                stall += 1
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def log_message(self, *a):
+                _file_log(f"[YT-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
+
+        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
+        self.srv.allow_reuse_address = True
+        self.srv.daemon_threads = True
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def done(self):
+        return self._done
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        if self.srv:
+            try:
+                self.srv.shutdown()
+            finally:
+                try:
+                    self.srv.server_close()
+                except Exception:
+                    pass
+            self.srv = None
+            self.thread = None
+        try:
+            if self.path and os.path.exists(self.path):
+                os.remove(self.path)
+            if self._dir and os.path.isdir(self._dir):
+                os.rmdir(self._dir)
+        except OSError:
+            pass
+
+
+# Internet-radio + cover-art "visualiser" mode (AzuraCast stations like dnbradio.com).
+_RADIO_HOSTS = ('dnbradio.com', 'azura.dnbradio.com')
+_RADIO_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+             '(KHTML, like Gecko) Chrome/120 Safari/537.36')
+_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+    '/Library/Fonts/Arial Bold.ttf',
+    'C:/Windows/Fonts/arialbd.ttf',
+)
+
+def is_radio_url(text):
+    """True for an AzuraCast radio station page we render as audio + live cover art."""
+    if not text or not text.startswith(('http://', 'https://')):
+        return False
+    host = text.split('://', 1)[-1].split('/', 1)[0].lower()
+    return any(host == d or host.endswith('.' + d) for d in _RADIO_HOSTS)
+
+
+def _radio_get(url, timeout=15):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': _RADIO_UA}),
+                                  timeout=timeout)
+
+
+class RadioStreamer:
+    """Play an internet radio station on a TV with a live visual: the current track's cover art
+    stretched-and-blurred as a full-screen background (no black bars), the sharp cover centred,
+    and the track/artist + station text on top. Cover and text update as tracks change, without
+    interrupting the stream — Python renders frames (PIL) into ffmpeg's stdin while ffmpeg mixes
+    them with the live audio into MPEG-TS.
+    """
+    W, H, FPS = 1280, 720, 5
+
+    def __init__(self, page_url, port, callback=None):
+        self.page_url = page_url
+        self.port = port
+        self.callback = callback or (lambda m: None)
+        self.channel = 'main'
+        self.title = 'Radio'
+        self.proc = None
+        self.srv = None
+        self.thread = None
+        self._dir = None
+        self.path = None
+        self._frame = None
+        self._art_id = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._logo = None
+        self._font_big = self._font_small = None
+
+    def _resolve(self):
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.page_url).query)
+        self.channel = (q.get('channel', ['main'])[0]) or 'main'
+        # The page's ?channel= is not 1:1 with the AzuraCast station shortcode (main → dnbradio,
+        # jungletrain → jungletrain.net, …), so resolve it via the stations API and use the real
+        # listen URL + shortcode. Fall back to a direct guess if the API is unreachable.
+        shortcode = self.channel
+        self.stream_url = f'https://azura.dnbradio.com/listen/{self.channel}/radio.mp3'
+        try:
+            stations = json.loads(_radio_get('https://azura.dnbradio.com/api/stations', 15).read())
+            st = self._match_station(stations, self.channel)
+            if st:
+                shortcode = st.get('shortcode') or self.channel
+                self.stream_url = st.get('listen_url') or self.stream_url
+        except Exception as e:
+            self.callback(f"[RADIO] stations API: {e}")
+        self.nowplaying = f'https://azura.dnbradio.com/api/nowplaying/{shortcode}'
+        self.title = f'DnBRadio · {self.channel}'
+
+    @staticmethod
+    def _match_station(stations, channel):
+        ch = (channel or '').lower()
+        target = {'main': 'dnbradio'}.get(ch, ch)   # the site's "main" is the "dnbradio" station
+        for s in stations:                          # exact shortcode
+            if (s.get('shortcode') or '').lower() == target:
+                return s
+        for s in stations:                          # partial match either way
+            sc = (s.get('shortcode') or '').lower()
+            if sc and (sc.startswith(ch) or ch in sc or sc.split('.')[0] == ch):
+                return s
+        return stations[0] if stations else None
+
+    def _load_assets(self):
+        font_path = next((p for p in _FONT_CANDIDATES if os.path.exists(p)), None)
+        try:
+            self._font_big = ImageFont.truetype(font_path, 40) if font_path else ImageFont.load_default()
+            self._font_small = ImageFont.truetype(font_path, 26) if font_path else ImageFont.load_default()
+        except Exception:
+            self._font_big = self._font_small = ImageFont.load_default()
+        # station logo (best-effort)
+        try:
+            data = _radio_get('https://dnbradio.com/images/dnbradio_sq.png', 15).read()
+            logo = Image.open(io.BytesIO(data)).convert('RGBA')
+            logo.thumbnail((120, 120))
+            self._logo = logo
+        except Exception:
+            self._logo = None
+
+    def _text(self, d, text, font, y, fill=(255, 255, 255)):
+        if not text:
+            return
+        while d.textlength(text, font=font) > self.W - 80 and len(text) > 4:
+            text = text[:-2]
+        x = self.W // 2 - d.textlength(text, font=font) / 2
+        d.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0))
+        d.text((x, y), text, font=font, fill=fill)
+
+    def _render(self, art_bytes, artist, title):
+        W, H = self.W, self.H
+        if art_bytes:
+            cover = Image.open(io.BytesIO(art_bytes)).convert('RGB')
+        else:
+            cover = Image.new('RGB', (400, 400), (20, 20, 28))
+        bg = cover.resize((W, H)).filter(ImageFilter.GaussianBlur(40))   # stretched + blurred fill
+        frame = Image.blend(bg, Image.new('RGB', (W, H), (0, 0, 0)), 0.35)
+        # Always a fixed-size square cover (upscale tiny art, centre-crop non-square) so the cover
+        # never looks tiny regardless of the source art's resolution.
+        side = 470
+        cov = ImageOps.fit(cover, (side, side), method=Image.LANCZOS)
+        frame.paste(cov, (W // 2 - side // 2, 300 - side // 2))
+        d = ImageDraw.Draw(frame, 'RGBA')
+        self._text(d, (title or '').upper(), self._font_big, 540)
+        self._text(d, artist or '', self._font_small, 590, fill=(180, 210, 255))
+        self._text(d, f'DnBRadio · {self.channel}'.upper(), self._font_small, 40, fill=(150, 150, 160))
+        if self._logo:
+            frame.paste(self._logo, (W - self._logo.width - 24, H - self._logo.height - 24), self._logo)
+        return frame.tobytes()
+
+    def _update_now(self):
+        try:
+            j = json.loads(_radio_get(self.nowplaying).read())
+            song = j.get('now_playing', {}).get('song', {})
+            art_id = song.get('art') or song.get('id')
+            if art_id == self._art_id:
+                return
+            art_bytes = None
+            if song.get('art'):
+                try:
+                    art_bytes = _radio_get(song['art'], 20).read()
+                except Exception:
+                    art_bytes = None
+            fb = self._render(art_bytes, song.get('artist', ''), song.get('title', ''))
+            with self._lock:
+                self._art_id = art_id
+                self._frame = fb
+            self.callback(f"[RADIO] now playing: {song.get('artist','')} — {song.get('title','')}")
+        except Exception as e:
+            self.callback(f"[RADIO] nowplaying: {e}")
+
+    def start(self):
+        """Resolve the station, start ffmpeg + frame feeder + now-playing watcher + HTTP server.
+        Returns True on success."""
+        if not HAS_PIL:
+            self.callback("[RADIO] Pillow not installed — radio visual unavailable")
+            return False
+        import tempfile
+        self._resolve()
+        self._load_assets()
+        self._dir = tempfile.mkdtemp(prefix='casttotv_radio_')
+        self.path = os.path.join(self._dir, 'stream.ts')
+        self._update_now()
+        if self._frame is None:
+            self._frame = self._render(None, '', '')
+
+        ff = [resolve_binary('ffmpeg'), '-loglevel', 'error',
+              '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{self.W}x{self.H}',
+              '-framerate', str(self.FPS), '-i', 'pipe:0',
+              '-user_agent', _RADIO_UA, '-i', self.stream_url,
+              '-map', '0:v:0', '-map', '1:a:0',
+              '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'stillimage',
+              '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
+              '-r', str(self.FPS), '-g', str(self.FPS * 4), '-bf', '0',
+              '-maxrate', '1800k', '-bufsize', '3600k',
+              '-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
+        self.callback("[RADIO] starting ffmpeg (cover art + audio)...")
+        self._errlog = os.path.join(self._dir, 'ff.log')
+        self.proc = subprocess.Popen(ff, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=open(self._errlog, 'w'), preexec_fn=_PREEXEC)
+        proc = self.proc
+
+        def feeder():
+            interval = 1.0 / self.FPS
+            while proc.poll() is None and not self._stop:
+                with self._lock:
+                    fb = self._frame
+                try:
+                    proc.stdin.write(fb)
+                except Exception:
+                    break
+                time.sleep(interval)
+        threading.Thread(target=feeder, daemon=True).start()
+
+        def watcher():
+            while proc.poll() is None and not self._stop:
+                time.sleep(12)
+                self._update_now()
+        threading.Thread(target=watcher, daemon=True).start()
+
+        # prefill
+        for _ in range(80):
+            time.sleep(0.5)
+            try:
+                if os.path.getsize(self.path) > 700_000:
+                    break
+            except OSError:
+                pass
+            if proc.poll() is not None:
+                tail = ''
+                try:
+                    tail = open(self._errlog).read()[-300:]
+                except OSError:
+                    pass
+                self.callback(f"[RADIO] ffmpeg died: {tail}")
+                return False
+        self.callback(f"[RADIO] buffered {os.path.getsize(self.path)//1024} KB — streaming")
+        self._serve()
+        return True
+
+    def _serve(self):
+        streamer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _hdr(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.send_header('contentFeatures.dlna.org',
+                                 'DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000')
+                self.end_headers()
+
+            def do_HEAD(self):
+                self._hdr()
+
+            def do_GET(self):
+                self._hdr()
+                stall = 0
+                try:
+                    with open(streamer.path, 'rb') as f:
+                        while stall < 600 and not streamer._stop:
+                            chunk = f.read(64 * 1024)
+                            if chunk:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                stall = 0
+                            else:
+                                time.sleep(0.1)
+                                stall += 1
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def log_message(self, *a):
+                _file_log(f"[RADIO-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
+
+        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
+        self.srv.allow_reuse_address = True
+        self.srv.daemon_threads = True
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        if self.srv:
+            try:
+                self.srv.shutdown()
+            finally:
+                try:
+                    self.srv.server_close()
+                except Exception:
+                    pass
+            self.srv = None
+            self.thread = None
+        try:
+            import shutil as _sh
+            if self._dir and os.path.isdir(self._dir):
+                _sh.rmtree(self._dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 class HTTPServerThread:
     def __init__(self, port, video_path, subtitle_path=None,
-                 video_url_name=None, subtitle_url_name=None):
+                 video_url_name=None, subtitle_url_name=None, total_size=0):
         self.port = port
         self.video_path = os.path.abspath(video_path) if video_path else None
         self.subtitle_path = os.path.abspath(subtitle_path) if subtitle_path else None
         self.video_url_name = video_url_name or (os.path.basename(self.video_path) if self.video_path else None)
         self.subtitle_url_name = subtitle_url_name or (os.path.basename(self.subtitle_path) if self.subtitle_path else None)
         self.subtitle_url = None
+        self.total_size = total_size
         self.server = None
         self.thread = None
         self.running = False
@@ -467,6 +1173,7 @@ class HTTPServerThread:
             subtitle_url=self.subtitle_url,
             video_url_name=self.video_url_name,
             subtitle_url_name=self.subtitle_url_name,
+            total_size=self.total_size,
             **kwargs)
         self.server = SilentThreadingTCPServer(('0.0.0.0', self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -703,7 +1410,7 @@ def _ssdp_unicast_lookup(ip, timeout=1.0):
     return None
 
 
-def fast_discover(callback=None, cancel_check=None):
+def fast_discover(callback=None, cancel_check=None, on_device=None):
     """SSDP multicast + parallel /24 port scan, run concurrently. Deduped, sorted by IP."""
     prefix = get_network_prefix()
     if callback:
@@ -711,11 +1418,30 @@ def fast_discover(callback=None, cancel_check=None):
 
     ssdp_devices = []
     lan_hosts = []
+    devices_by_key = {}
+    covered_ips = set()
+    _lock = threading.Lock()
+
+    def _emit(d, label=None):
+        key = (d['ip'], d['port'])
+        with _lock:
+            if key in devices_by_key:
+                return False
+            devices_by_key[key] = d
+            covered_ips.add(d['ip'])
+        if callback and label:
+            callback(label)
+        if on_device:
+            on_device(d)
+        return True
 
     def do_ssdp():
-        ssdp_devices.extend(discover_dlna_renderers(timeout=2, retries=3,
-                                                     callback=callback,
-                                                     cancel_check=cancel_check))
+        devs = discover_dlna_renderers(timeout=2, retries=3,
+                                       callback=callback,
+                                       cancel_check=cancel_check)
+        for d in devs:
+            _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
+        ssdp_devices.extend(devs)
 
     def do_lan():
         lan_hosts.extend(fast_lan_scan(prefix, callback=callback,
@@ -726,9 +1452,6 @@ def fast_discover(callback=None, cancel_check=None):
     t1.start(); t2.start()
     t1.join(); t2.join()
 
-    devices_by_key = {(d['ip'], d['port']): d for d in ssdp_devices}
-    covered_ips = {d['ip'] for d in ssdp_devices}
-
     # For LAN hosts that didn't reply to multicast SSDP, try unicast in parallel
     unicast_ips = [ip for ip in lan_hosts if ip not in covered_ips]
     if unicast_ips and not (cancel_check and cancel_check()):
@@ -738,15 +1461,9 @@ def fast_discover(callback=None, cancel_check=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             for d in ex.map(_ssdp_unicast_lookup, unicast_ips):
                 if d:
-                    key = (d['ip'], d['port'])
-                    if key not in devices_by_key:
-                        devices_by_key[key] = d
-                        covered_ips.add(d['ip'])
-                        if callback:
-                            callback(f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
+                    _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']})")
 
     # Last resort: hosts that responded to TCP but have no SSDP at all (some LG webOS TVs).
-    # Deep-scan ports in parallel and HTTP-probe for AVTransport.
     deep_ips = [ip for ip in lan_hosts if ip not in covered_ips]
     if deep_ips and not (cancel_check and cancel_check()):
         if callback:
@@ -756,11 +1473,7 @@ def fast_discover(callback=None, cancel_check=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(deep_ips))) as ex:
             for d in ex.map(_deep, deep_ips):
                 if d:
-                    key = (d['ip'], d['port'])
-                    if key not in devices_by_key:
-                        devices_by_key[key] = d
-                        if callback:
-                            callback(f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']}) via deep scan")
+                    _emit(d, f"[OK] {d['friendly_name']} ({d['ip']}:{d['port']}) via deep scan")
 
     return sorted(devices_by_key.values(),
                    key=lambda x: (tuple(int(o) for o in x['ip'].split('.')), x['port']))
@@ -914,8 +1627,24 @@ def _soap_call(control_url, soap_action, body, callback=None, timeout=30):
         return False, str(e)
 
 
+class MediaSource:
+    """What gets handed to a cast backend: an HTTP(S) URL plus the metadata a renderer needs.
+
+    Decouples *where the bytes come from* (local file / YouTube / Rutube / direct URL) from
+    *which protocol plays it* (DLNA today; Chromecast / AirPlay slot in via play_on()).
+    """
+    def __init__(self, url, mime='video/mp4', title='Video', duration=None, subtitle_url=None,
+                 dlna_op=None):
+        self.url = url
+        self.mime = mime
+        self.title = title
+        self.duration = duration
+        self.subtitle_url = subtitle_url
+        self.dlna_op = dlna_op   # '10' to advertise time-seek (transcoded streams → TV shows duration)
+
+
 def cast_video(video_url, control_url, subtitle_url=None, title=None,
-               video_mime='video/mp4', duration=None, callback=None):
+               video_mime='video/mp4', duration=None, callback=None, dlna_op=None):
     """Send video to DLNA renderer. Minimal January-style DIDL (LG webOS UP7750PTB verified).
 
     Auto-recovers from 701 "Transition not available" by sending Stop and retrying SetURI.
@@ -937,7 +1666,9 @@ def cast_video(video_url, control_url, subtitle_url=None, title=None,
     # video/mp4 в protocolInfo даже для MKV — LG webOS так умеет.
     # Минимум флагов: OP=01 + FLAGS=01700000... — НЕ добавлять PN/CI/size, они ломают LG.
     # Для MPEG-TS (video/MP2T) — OP=00 (no Range), флаги те же.
-    op = '00' if video_mime == 'video/MP2T' else '01'
+    # dlna_op='10' = time-seek (used for transcoded streams so the TV reads duration from the
+    # TimeSeekRange npt header). Otherwise OP=00 for MP2T (no range), OP=01 for files.
+    op = dlna_op or ('00' if video_mime == 'video/MP2T' else '01')
     proto = f'http-get:*:{video_mime}:DLNA.ORG_OP={op};DLNA.ORG_FLAGS=01700000000000000000000000000000'
     duration_attr = f' duration="{duration}"' if duration else ''
     didl = (f'<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
@@ -1095,7 +1826,7 @@ class MatrixRain:
         self.w, self.h = w, h
         self.cols = w // 14
         self.drops = [random.randint(-15, 0) for _ in range(self.cols)]
-        self.chars = "D3xLGWebOS01TV"
+        self.chars = "CASTTOTV0123<>/\\"
 
     def update(self):
         self.canvas.delete("m")
@@ -1103,24 +1834,63 @@ class MatrixRain:
             x = i * 14 + 5
             c = random.choice(self.chars)
             self.canvas.create_text(x, d * 15, text=c, fill="#00FF00",
-                                    font=("Consolas", 10, "bold"), tags="m")
+                                    font=(MONO, 10, "bold"), tags="m")
             for j in range(1, 5):
                 if d - j > 0:
                     g = max(0, 180 - j * 40)
                     self.canvas.create_text(x, (d - j) * 15, text=random.choice(self.chars),
-                                            fill=f"#00{g:02x}00", font=("Consolas", 10), tags="m")
+                                            fill=f"#00{g:02x}00", font=(MONO, 10), tags="m")
             self.drops[i] += 1
             if self.drops[i] * 15 > self.h + 60:
                 self.drops[i] = random.randint(-8, 0)
 
 # ============= KEYGEN GUI =============
 
+# Default monospace family. "Consolas" only exists on Windows; on Linux/macOS Tk would fall
+# back to an ugly proportional default, so we resolve a good installed mono at startup.
+MONO = "Consolas"
+
+def _pick_mono_font(root):
+    """Pick the best installed monospace family (Consolas on Windows, a sane mono elsewhere)."""
+    try:
+        import tkinter.font as tkfont
+        available = set(tkfont.families(root))
+    except Exception:
+        return "Consolas"
+    for fam in ("Consolas", "DejaVu Sans Mono", "Ubuntu Mono", "Liberation Mono",
+                "Noto Sans Mono", "Menlo", "Courier New", "Monospace"):
+        if fam in available:
+            return fam
+    return "TkFixedFont"
+
+
 class KeygenApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"D3x LG Caster v{VERSION}")
-        self.root.geometry("720x780")
-        self.root.resizable(False, False)
+        self.root.title(f"CastToTV v{VERSION}")
+        global MONO
+        MONO = _pick_mono_font(self.root)
+        # HiDPI scaling. winfo_screenmmwidth() is unreliable on X11 (often 0 or a bogus EDID
+        # value → exploding scale), so we don't derive DPI from physical size. Order:
+        #   1. explicit CASTTOTV_SCALE env override (e.g. "1.5"),
+        #   2. Tk's own reported DPI via winfo_fpixels('1i') — reliable — only if clearly HiDPI,
+        #   3. otherwise 1.0 with the native 720x780 layout.
+        scale = 1.0
+        try:
+            env_scale = os.environ.get('CASTTOTV_SCALE')
+            if env_scale:
+                scale = max(1.0, float(env_scale))
+            else:
+                dpi = float(self.root.winfo_fpixels('1i'))  # px per inch as Tk sees it
+                if dpi > 120:
+                    scale = max(1.0, round(dpi / 96, 1))
+        except Exception:
+            scale = 1.0
+        if scale > 1.0:
+            self.root.tk.call('tk', 'scaling', scale)
+        self.scale = scale
+        self.root.geometry(f"{int(720 * scale)}x{int(780 * scale)}")
+        self.root.resizable(True, True)
         self.root.configure(bg='#000000')
 
         self.discovered_device = None  # {ip, port, friendly_name, control_url, ...}
@@ -1136,70 +1906,83 @@ class KeygenApp:
         self._seek_pos = 0
         self.http_server = None
         self.dongle_caster = None
+        self.youtube_streamer = None
+        self.radio_streamer = None
+        self._cc_casts = {}       # uuid -> pychromecast.Chromecast (live, from discovery)
+        self._cc_browser = None   # kept alive for the session so cast objects stay connected
+        self._airplay_confs = {}  # identifier -> pyatv config (from discovery)
+        self._aloop = None        # lazily-created background asyncio loop for pyatv
         self.paused = False
 
         # Truncate log file at startup so it holds only the current run
         try:
             with open(_LOG_PATH, 'w', encoding='utf-8') as f:
-                f.write(f"=== D3x LG Caster v{VERSION} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                f.write(f"=== CastToTV v{VERSION} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
         except Exception:
             pass
 
         self.build_ui()
-        self.matrix = MatrixRain(self.matrix_canvas, 720, 780)
+        self.matrix = MatrixRain(self.matrix_canvas, int(720 * self.scale), int(780 * self.scale))
         self.animate_matrix()
 
     def build_ui(self):
-        self.matrix_canvas = tk.Canvas(self.root, width=720, height=780, bg='#000000', highlightthickness=0)
+        self.matrix_canvas = tk.Canvas(self.root, width=int(720 * self.scale), height=int(780 * self.scale),
+                                       bg='#000000', highlightthickness=0)
         self.matrix_canvas.place(x=0, y=0)
 
         frame = tk.Frame(self.root, bg='#000000')
         frame.place(relx=0.5, rely=0.5, anchor='center')
 
-        banner = f"""
-\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551    ____  _____         __    ______   ______          __  \u2551
-\u2551   / __ \\|__  /_ __    / /   / ____/  /_  __/__  __   / /  \u2551
-\u2551  / / / / /_ <\\ \\ /   / /   / / __     / /  \\ \\ / /  / /   \u2551
-\u2551 / /_/ /___/ / /_/   / /___/ /_/ /    / /    \\ V /  /_/    \u2551
-\u2551/_____//____/       /_____/\\____/    /_/      \\_/  (_)     \u2551
-\u2551                                                           \u2551
-\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
-\u2551  [ DLNA Caster ]           v{VERSION}  *  D3x  *  2026  \u2551
-\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"""
-
-        tk.Label(frame, text=banner, font=("Consolas", 7), fg='#00FF00', bg='#000000', justify='left').pack()
+        # Framed keygen banner — shadow figlet art (baked, no runtime figlet dependency).
+        # Width is derived from the content so the right border always lines up.
+        _art = [
+            r'  ___|    \     ___|__ __| __ __| _ \  __ __|\ \     /',
+            r' |       _ \  \___ \   |      |  |   |    |   \ \   /',
+            r' |      ___ \       |  |      |  |   |    |    \ \ /',
+            r'\____|_/    _\_____/  _|     _| \___/    _|     \_/',
+        ]
+        _sub = 'multi-room media caster · DLNA · Chromecast · AirPlay · YouTube · Rutube'
+        _footer = f'v{VERSION}   ·   near-synchronous casting   ·   2026'
+        _w = max(len(s) for s in _art + [_sub, _footer])
+        _top = '╔' + '═' * (_w + 2) + '╗'
+        _mid = '╠' + '═' * (_w + 2) + '╣'
+        _bot = '╚' + '═' * (_w + 2) + '╝'
+        banner = '\n' + '\n'.join(
+            [_top] + ['║ ' + s.ljust(_w) + ' ║' for s in _art] +
+            [_mid, '║ ' + _sub.ljust(_w) + ' ║', '║ ' + _footer.ljust(_w) + ' ║', _bot]
+        )
+        tk.Label(frame, text=banner, font=(MONO, 8), fg='#00FF00', bg='#000000', justify='left').pack()
 
         # Music toggle
         top_row = tk.Frame(frame, bg='#000000')
         top_row.pack(fill='x', padx=10)
-        self.music_btn = tk.Button(top_row, text="\u266b MUSIC OFF", font=("Consolas", 8, "bold"),
+        self.music_btn = tk.Button(top_row, text="\u266b MUSIC OFF", font=(MONO, 8, "bold"),
             fg='#000000', bg='#555555', command=self.toggle_music, width=12, bd=2)
         self.music_btn.pack(side='right')
 
         # Log
         log_frame = tk.Frame(frame, bg='#001100', relief='sunken', bd=2)
         log_frame.pack(fill='x', padx=10, pady=5)
-        self.log_text = tk.Text(log_frame, height=14, width=78, font=("Consolas", 9),
+        self.log_text = tk.Text(log_frame, height=14, width=78, font=(MONO, 9),
             fg='#00FF00', bg='#001100', state='disabled')
         self.log_text.pack(padx=3, pady=3)
 
         # Manual IP entry + device info
         ip_frame = tk.Frame(frame, bg='#000000')
         ip_frame.pack(fill='x', padx=10, pady=3)
-        tk.Label(ip_frame, text="[IP]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
-        self.ip_entry = tk.Entry(ip_frame, width=15, font=("Consolas", 9), fg='#00FF00', bg='#001100')
+        tk.Label(ip_frame, text="[IP]", font=(MONO, 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        self.ip_entry = tk.Entry(ip_frame, width=15, font=(MONO, 9), fg='#00FF00', bg='#001100')
         self.ip_entry.pack(side='left', padx=3)
-        tk.Button(ip_frame, text="CONNECT", font=("Consolas", 8, "bold"), fg='#000', bg='#FF9900',
+        tk.Button(ip_frame, text="CONNECT", font=(MONO, 8, "bold"), fg='#000', bg='#FF9900',
             command=self.do_manual_connect, bd=2).pack(side='left', padx=3)
-        self.status_lbl = tk.Label(ip_frame, text="READY", font=("Consolas", 9, "bold"),
+        self.status_lbl = tk.Label(ip_frame, text="READY", font=(MONO, 9, "bold"),
             fg='#FFFF00', bg='#000000', width=14)
         self.status_lbl.pack(side='right')
 
         # Device dropdown (populated by DISCOVER / CONNECT)
         dev_frame = tk.Frame(frame, bg='#000000')
         dev_frame.pack(fill='x', padx=10, pady=1)
-        tk.Label(dev_frame, text="[TV]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        tk.Label(dev_frame, text="[TV]", font=(MONO, 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
         style = ttk.Style()
         try:
             style.theme_use('clam')
@@ -1214,8 +1997,8 @@ class KeygenApp:
         self.root.option_add('*TCombobox*Listbox.foreground', '#00FF00')
         self.root.option_add('*TCombobox*Listbox.selectBackground', '#006600')
         self.root.option_add('*TCombobox*Listbox.selectForeground', '#000000')
-        self.root.option_add('*TCombobox*Listbox.font', ('Consolas', 9))
-        self.dev_combo = ttk.Combobox(dev_frame, state='readonly', font=("Consolas", 9),
+        self.root.option_add('*TCombobox*Listbox.font', (MONO, 9))
+        self.dev_combo = ttk.Combobox(dev_frame, state='readonly', font=(MONO, 9),
                                       style='Keygen.TCombobox', height=12)
         self.dev_combo.pack(side='left', padx=5, fill='x', expand=True)
         self.dev_combo.bind('<<ComboboxSelected>>', self._on_device_selected)
@@ -1225,19 +2008,19 @@ class KeygenApp:
         # File
         file_frame = tk.Frame(frame, bg='#000000')
         file_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(file_frame, text="[FILE]", font=("Consolas", 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
-        self.file_entry = tk.Entry(file_frame, width=52, font=("Consolas", 9), fg='#00FF00', bg='#001100')
+        tk.Label(file_frame, text="[FILE]", font=(MONO, 9, "bold"), fg='#00FF00', bg='#000000').pack(side='left')
+        self.file_entry = tk.Entry(file_frame, width=52, font=(MONO, 9), fg='#00FF00', bg='#001100')
         self.file_entry.pack(side='left', padx=5)
-        tk.Button(file_frame, text="[...]", font=("Consolas", 9, "bold"), fg='#000', bg='#00FF00',
+        tk.Button(file_frame, text="[...]", font=(MONO, 9, "bold"), fg='#000', bg='#00FF00',
             command=self.browse, bd=2).pack(side='left')
 
         # Subtitles
         sub_frame = tk.Frame(frame, bg='#000000')
         sub_frame.pack(fill='x', padx=10, pady=2)
-        tk.Label(sub_frame, text="[SUBS]", font=("Consolas", 9, "bold"), fg='#00CCFF', bg='#000000').pack(side='left')
-        self.sub_entry = tk.Entry(sub_frame, width=52, font=("Consolas", 9), fg='#00CCFF', bg='#001100')
+        tk.Label(sub_frame, text="[SUBS]", font=(MONO, 9, "bold"), fg='#00CCFF', bg='#000000').pack(side='left')
+        self.sub_entry = tk.Entry(sub_frame, width=52, font=(MONO, 9), fg='#00CCFF', bg='#001100')
         self.sub_entry.pack(side='left', padx=5)
-        tk.Button(sub_frame, text="[...]", font=("Consolas", 9, "bold"), fg='#000', bg='#00CCFF',
+        tk.Button(sub_frame, text="[...]", font=(MONO, 9, "bold"), fg='#000', bg='#00CCFF',
             command=self.browse_subs, bd=2).pack(side='left')
 
         # Streaming mode toggle: force MPEG-TS via ffmpeg (for dongles or AC3/DTS audio)
@@ -1248,43 +2031,53 @@ class KeygenApp:
         tk.Checkbutton(mode_frame,
                        text=f"[MODE] Force MPEG-TS (dongle / AC3 / DTS{ffmpeg_tip})",
                        variable=self.dongle_mode_var,
-                       font=("Consolas", 8, "bold"),
+                       font=(MONO, 8, "bold"),
                        fg='#FFAA00', bg='#000000',
                        activeforeground='#FFCC00', activebackground='#000000',
                        selectcolor='#001100',
                        state='normal' if HAS_FFMPEG else 'disabled').pack(side='left')
 
+        # Multi-room: fan the same stream out to every discovered room at once.
+        self.multi_var = tk.IntVar(value=0)
+        tk.Checkbutton(mode_frame,
+                       text="[MULTI] all rooms (sync)",
+                       variable=self.multi_var,
+                       font=(MONO, 8, "bold"),
+                       fg='#00FFAA', bg='#000000',
+                       activeforeground='#00FFCC', activebackground='#000000',
+                       selectcolor='#001100').pack(side='right')
+
         # Buttons row 1
         btn1 = tk.Frame(frame, bg='#000000')
         btn1.pack(pady=8)
-        tk.Button(btn1, text="< DISCOVER >", font=("Consolas", 10, "bold"), fg='#000', bg='#00FFFF',
+        tk.Button(btn1, text="< DISCOVER >", font=(MONO, 10, "bold"), fg='#000', bg='#00FFFF',
             command=self.do_discover, width=14, bd=3).pack(side='left', padx=5)
-        tk.Button(btn1, text="DONGLE WiFi", font=("Consolas", 9, "bold"), fg='#000', bg='#FF9900',
+        tk.Button(btn1, text="DONGLE WiFi", font=(MONO, 9, "bold"), fg='#000', bg='#FF9900',
             command=self.do_dongle_setup, width=11, bd=3).pack(side='left', padx=5)
 
         # Buttons row 2
         btn2 = tk.Frame(frame, bg='#000000')
         btn2.pack(pady=5)
-        self.cancel_btn = tk.Button(btn2, text="< CANCEL >", font=("Consolas", 10, "bold"), fg='#000', bg='#FF0000',
+        self.cancel_btn = tk.Button(btn2, text="< CANCEL >", font=(MONO, 10, "bold"), fg='#000', bg='#FF0000',
             command=self.cancel, width=12, bd=3, state='disabled')
         self.cancel_btn.pack(side='left', padx=5)
-        tk.Button(btn2, text="<<< CAST >>>", font=("Consolas", 10, "bold"), fg='#000', bg='#FF6600',
+        tk.Button(btn2, text="<<< CAST >>>", font=(MONO, 10, "bold"), fg='#000', bg='#FF6600',
             command=self.do_cast, width=14, bd=3).pack(side='left', padx=5)
-        self.pause_btn = tk.Button(btn2, text="< PAUSE >", font=("Consolas", 10, "bold"), fg='#000', bg='#FFAA00',
+        self.pause_btn = tk.Button(btn2, text="< PAUSE >", font=(MONO, 10, "bold"), fg='#000', bg='#FFAA00',
             command=self.do_pause, width=11, bd=3)
         self.pause_btn.pack(side='left', padx=5)
-        tk.Button(btn2, text="< STOP >", font=("Consolas", 10, "bold"), fg='#000', bg='#AA0000',
+        tk.Button(btn2, text="< STOP >", font=(MONO, 10, "bold"), fg='#000', bg='#AA0000',
             command=self.do_stop, width=10, bd=3).pack(side='left', padx=5)
 
         # Seek buttons
         seek_frame = tk.Frame(frame, bg='#000000')
         seek_frame.pack(pady=3)
         for label, sec in [("<<30s", -30), ("<<10s", -10), (">>10s", 10), (">>30s", 30), (">>5m", 300)]:
-            tk.Button(seek_frame, text=label, font=("Consolas", 8, "bold"), fg='#00FF00', bg='#003300',
+            tk.Button(seek_frame, text=label, font=(MONO, 8, "bold"), fg='#00FF00', bg='#003300',
                 command=lambda s=sec: self.do_seek(s), width=6, bd=2).pack(side='left', padx=2)
 
         # Now Playing label
-        self.now_playing = tk.Label(frame, text="[NOW] Nothing", font=("Consolas", 8),
+        self.now_playing = tk.Label(frame, text="[NOW] Nothing", font=(MONO, 8),
             fg='#888888', bg='#000000', anchor='w')
         self.now_playing.pack(fill='x', padx=10, pady=2)
 
@@ -1292,9 +2085,9 @@ class KeygenApp:
         tk.Label(frame, text=("\u2550" * 67 + "\n" +
             "  Greets: Scene 2005 | #warez | The good old days\n" +
             f"  HTTP Server built-in  *  Port {self.server_port}  *  All-in-one"),
-            font=("Consolas", 8), fg='#006600', bg='#000000').pack(pady=3)
+            font=(MONO, 8), fg='#006600', bg='#000000').pack(pady=3)
 
-        self.log(f"[SYS] D3x DLNA Caster v{VERSION} initialized")
+        self.log(f"[SYS] CastToTV v{VERSION} initialized")
         self.log("[SYS] Click DISCOVER or enter IP and click CONNECT")
 
     def animate_matrix(self):
@@ -1349,7 +2142,8 @@ class KeygenApp:
         self.log("[!] Cancelled by user")
 
     def _device_label(self, device):
-        return f"{device['friendly_name']} — {device['ip']}:{device['port']}"
+        tag = device.get('protocol', 'dlna').upper()
+        return f"[{tag}] {device['friendly_name']} — {device['ip']}:{device['port']}"
 
     def _refresh_dev_combo(self, select_index=None):
         def _apply():
@@ -1446,14 +2240,21 @@ class KeygenApp:
         """Fast combined discovery: SSDP multicast + parallel TCP scan of DLNA ports across /24."""
         def run():
             self.set_scanning(True)
+            self.device_list = []
             t0 = time.time()
             devices = fast_discover(callback=self.log,
-                                    cancel_check=lambda: self.cancel_flag)
+                                    cancel_check=lambda: self.cancel_flag,
+                                    on_device=lambda d: self.root.after(0, lambda dev=d: self._add_device(dev)))
+            if HAS_CHROMECAST and not self.cancel_flag:
+                self._discover_chromecasts()
+            if HAS_AIRPLAY and not self.cancel_flag:
+                self._discover_airplay()
             elapsed = time.time() - t0
             if self.cancel_flag:
                 self.set_scanning(False)
                 return
-            self._populate_devices(devices)
+            if not self.device_list:
+                self._populate_devices(devices)
             if devices:
                 self.log(f"[OK] {len(devices)} renderer(s) in {elapsed:.1f}s")
             else:
@@ -1461,6 +2262,47 @@ class KeygenApp:
                 self.log("[TIP] Enter IP manually and click CONNECT")
             self.set_scanning(False)
         threading.Thread(target=run, daemon=True).start()
+
+    def _discover_chromecasts(self):
+        """Add Chromecast devices to the dropdown, tagged [CHROMECAST]. Keeps the cast objects
+        alive in self._cc_casts so play_on() can reach them without re-scanning."""
+        self.log("[CC] Scanning for Chromecast / Google Cast...")
+        try:
+            casts, browser = discover_chromecasts(timeout=4)
+        except Exception as e:
+            self.log(f"[CC] discovery error: {e}")
+            return
+        self._cc_browser = browser
+        for cc in casts:
+            ci = cc.cast_info
+            uuid = str(ci.uuid)
+            self._cc_casts[uuid] = cc
+            dev = {'ip': ci.host, 'port': ci.port, 'friendly_name': ci.friendly_name,
+                   'protocol': 'chromecast', 'uuid': uuid, 'control_url': None}
+            self.root.after(0, lambda d=dev: self._add_device(d))
+            self.log(f"[CC] {ci.friendly_name} ({ci.host})")
+
+    def _ensure_aloop(self):
+        if self._aloop is None:
+            self._aloop = _AsyncLoop()
+        return self._aloop
+
+    def _discover_airplay(self):
+        """Add AirPlay / Apple TV receivers to the dropdown, tagged [AIRPLAY]. Configs are
+        kept in self._airplay_confs so play_on() can connect without re-scanning."""
+        self.log("[AP] Scanning for AirPlay / Apple TV...")
+        try:
+            confs = discover_airplay(self._ensure_aloop(), timeout=4)
+        except Exception as e:
+            self.log(f"[AP] discovery error: {e}")
+            return
+        for c in confs:
+            ident = c.identifier or str(c.address)
+            self._airplay_confs[ident] = c
+            dev = {'ip': str(c.address), 'port': 0, 'friendly_name': c.name,
+                   'protocol': 'airplay', 'uuid': ident, 'control_url': None}
+            self.root.after(0, lambda d=dev: self._add_device(d))
+            self.log(f"[AP] {c.name} ({c.address})")
 
     def do_seek(self, delta_secs):
         """Seek via DLNA Seek SOAP — TV handles position natively for direct file streams."""
@@ -1531,6 +2373,111 @@ class KeygenApp:
             self.status_lbl.config(text="STOPPED", fg='#FFFF00')
         threading.Thread(target=run, daemon=True).start()
 
+    def play_on(self, target, source):
+        """Dispatch a MediaSource to one cast target by its protocol. Returns (ok, message).
+
+        Today only DLNA is wired; Chromecast / AirPlay backends slot in here without
+        touching the rest of do_cast. Multi-room fan-out (Phase 4) will call this per target.
+        """
+        protocol = (target.get('protocol') if isinstance(target, dict) else None) or 'dlna'
+        if protocol == 'dlna':
+            return cast_video(source.url, target['control_url'],
+                              subtitle_url=source.subtitle_url, video_mime=source.mime,
+                              duration=source.duration, title=source.title, callback=self.log,
+                              dlna_op=getattr(source, 'dlna_op', None))
+        if protocol == 'chromecast':
+            return self._play_chromecast(target, source)
+        if protocol == 'airplay':
+            return self._play_airplay(target, source)
+        if protocol == 'miracast':
+            # Miracast mirrors the whole screen over Wi-Fi Direct — it's not an in-app HTTP
+            # stream, so we can't push a single source to it from here. See README/help.
+            return False, "Miracast is screen-mirroring only — use the system display helper"
+        return False, f"protocol '{protocol}' not supported yet"
+
+    def _dedupe_targets(self, devices):
+        """Collapse multiple entries for the same physical box (a dongle that answers both
+        DLNA and AirPlay shouldn't get the stream twice) — keep the first per IP."""
+        seen, out = set(), []
+        for d in devices:
+            ip = d.get('ip')
+            if ip in seen:
+                continue
+            seen.add(ip)
+            out.append(d)
+        return out
+
+    def cast_to_all(self, targets, source):
+        """Fan one MediaSource out to N rooms. A threading.Barrier releases every Play at the
+        same instant (best-effort sync — independent clocks still drift a few seconds).
+        Returns a list of (target, ok, message)."""
+        results, lock = [], threading.Lock()
+        barrier = threading.Barrier(len(targets))
+
+        def fire(t):
+            try:
+                barrier.wait(timeout=12)   # line everyone up, then fire together
+            except Exception:
+                pass
+            ok, msg = self.play_on(t, source)
+            with lock:
+                results.append((t, ok, msg))
+
+        threads = [threading.Thread(target=fire, args=(t,), daemon=True) for t in targets]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=30)
+        return results
+
+    def _play_airplay(self, target, source):
+        """Stream a MediaSource to an AirPlay receiver via pyatv (fire-and-forget on the loop)."""
+        if not HAS_AIRPLAY:
+            return False, "pyatv not installed"
+        conf = self._airplay_confs.get(target.get('uuid'))
+        if conf is None:
+            return False, "AirPlay device not found — run DISCOVER again"
+        aloop = self._ensure_aloop()
+
+        async def _go():
+            atv = await pyatv.connect(conf, aloop.loop)
+            try:
+                await atv.stream.play_url(source.url)
+            finally:
+                atv.close()
+
+        try:
+            fut = aloop.submit(_go())   # play_url runs until the clip ends; don't block the UI
+        except Exception as e:
+            return False, f"AirPlay error: {type(e).__name__}: {e}"
+
+        def _done(f):
+            exc = f.exception()
+            if exc:
+                self.log(f"[AP] play error: {type(exc).__name__}: {exc}")
+        fut.add_done_callback(_done)
+        return True, "AirPlay started"
+
+    def _play_chromecast(self, target, source):
+        """Hand a MediaSource to a Chromecast via pychromecast's MediaController."""
+        if not HAS_CHROMECAST:
+            return False, "pychromecast not installed"
+        cc = self._cc_casts.get(target.get('uuid'))
+        if cc is None:
+            return False, "Chromecast not found — run DISCOVER again"
+        # Chromecast can't decode MPEG-TS; our YouTube/dongle streams are TS. Direct mp4 is fine.
+        if source.mime == 'video/MP2T':
+            return False, "Chromecast can't play MPEG-TS — use a local MP4 or a direct video URL"
+        try:
+            cc.wait(timeout=10)
+            mc = cc.media_controller
+            mc.play_media(source.url, source.mime, title=source.title,
+                          subtitles=source.subtitle_url or None)
+            mc.block_until_active(timeout=10)
+            return True, "Chromecast playing"
+        except Exception as e:
+            return False, f"Chromecast error: {type(e).__name__}: {e}"
+
     def do_cast(self):
         video = self.file_entry.get().strip()
         subs = self.sub_entry.get().strip()
@@ -1548,7 +2495,53 @@ class KeygenApp:
             sub_url = None
             video_mime = 'video/mp4'
             duration = None
-            if video.startswith("http"):
+            dlna_op = None
+            if is_radio_url(video):
+                # ---- Internet radio + live cover-art visual ----
+                self.log("[RADIO] Resolving station...")
+                if self.dongle_caster:
+                    self.dongle_caster.stop(); self.dongle_caster = None
+                if self.youtube_streamer:
+                    self.youtube_streamer.stop()
+                if self.radio_streamer:
+                    self.radio_streamer.stop()
+                streamer = RadioStreamer(video, self.server_port + 2, callback=self.log)
+                self.radio_streamer = streamer
+                if not streamer.start():
+                    self.log("[ERR] Could not start radio")
+                    self.status_lbl.config(text="FAILED", fg='#FF0000')
+                    return
+                local = get_local_ip()
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                name = streamer.title
+                video_mime = 'video/MP2T'
+            elif is_extractable_url(video):
+                # ---- Extractable URL (YouTube / Rutube / …): yt-dlp → ffmpeg → growing TS → DLNA ----
+                self.log("[YT] Resolving stream via yt-dlp...")
+                # Free the shared dongle port and any previous extracted stream.
+                if self.dongle_caster:
+                    self.dongle_caster.stop()
+                    self.dongle_caster = None
+                if self.youtube_streamer:
+                    self.youtube_streamer.stop()
+                streamer = YoutubeStreamer(video, self.server_port + 2, callback=self.log)
+                self.youtube_streamer = streamer
+                stream_urls = streamer.probe()
+                if not stream_urls:
+                    self.log("[ERR] Could not resolve a playable stream")
+                    self.status_lbl.config(text="FAILED", fg='#FF0000')
+                    return
+                self.log(f"[YT] {streamer.title or 'stream'} — {streamer.duration or 'unknown'}")
+                local = get_local_ip()
+                streamer.start(stream_urls)
+                streamer.wait_prefill()
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                name = streamer.title or 'Stream'
+                duration = streamer.play_duration or streamer.duration
+                video_mime = 'video/MP2T'
+                dlna_op = '10' if streamer.play_seconds else None   # time-seek → TV shows duration
+                self.log(f"[YT] Streaming: {url}")
+            elif video.startswith("http"):
                 url = video
                 name = video.split('/')[-1][:40]
             else:
@@ -1685,10 +2678,20 @@ class KeygenApp:
 
             self.log(f"[CAST] {self.discovered_device['friendly_name']}")
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
-            title = os.path.splitext(name)[0] if not video.startswith('http') else 'Video'
-            ok, msg = cast_video(url, control, subtitle_url=sub_url,
-                                 video_mime=video_mime, duration=duration,
-                                 title=title, callback=self.log)
+            title = os.path.splitext(name)[0] if not video.startswith('http') and not is_extractable_url(video) else name
+            source = MediaSource(url, mime=video_mime, title=title,
+                                 duration=duration, subtitle_url=sub_url, dlna_op=dlna_op)
+            if self.multi_var.get() and len(self.device_list) > 1:
+                targets = self._dedupe_targets(self.device_list)
+                self.log(f"[MULTI] Casting to {len(targets)} room(s), synchronised start...")
+                results = self.cast_to_all(targets, source)
+                ok_n = sum(1 for _, ok_i, _ in results if ok_i)
+                for t, ok_i, m in results:
+                    self.log(f"[MULTI] {self._device_label(t)} -> {'OK' if ok_i else 'FAIL: ' + m}")
+                ok = ok_n > 0
+                msg = f"{ok_n}/{len(results)} room(s) playing"
+            else:
+                ok, msg = self.play_on(self.discovered_device, source)
             if ok:
                 self.log("[OK] Streaming started!")
                 if sub_url:
@@ -1711,6 +2714,17 @@ class KeygenApp:
             self.http_server.stop()
         if self.dongle_caster:
             self.dongle_caster.stop()
+        if self.youtube_streamer:
+            self.youtube_streamer.stop()
+        if self.radio_streamer:
+            self.radio_streamer.stop()
+        if self._cc_browser is not None:
+            try:
+                pychromecast.discovery.stop_discovery(self._cc_browser)
+            except Exception:
+                pass
+        if self._aloop is not None:
+            self._aloop.stop()
         self.root.destroy()
 
 def main():
