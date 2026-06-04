@@ -162,6 +162,12 @@ try:
 except Exception:
     HAS_AIRPLAY = False
 
+try:
+    from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageOps
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
 
 def discover_chromecasts(timeout=4):
     """Blocking Chromecast scan. Returns (cast_objects, browser); each cast exposes
@@ -569,21 +575,19 @@ class SilentThreadingTCPServer(socketserver.ThreadingTCPServer):
         else:
             super().handle_error(request, client_address)
 
-# Sites we hand to yt-dlp for resolution (vs. a direct media link, which we serve as-is).
-_EXTRACTABLE_DOMAINS = (
-    'youtube.com', 'youtu.be', 'yt.be', 'youtube-nocookie.com',
-    'rutube.ru', 'vk.com', 'vkvideo.ru', 'ok.ru',
-    'dailymotion.com', 'vimeo.com',
-)
+# A direct media file we serve as-is; anything else that's a web page goes through yt-dlp.
+_DIRECT_MEDIA_EXT = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv',
+                     '.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg')
 
 def is_extractable_url(text):
-    """True for a page URL yt-dlp should resolve (YouTube, Rutube, …) rather than a direct
-    media URL we can pass to the renderer unchanged."""
-    if not text:
+    """True for a page URL yt-dlp should resolve. Any http(s) page that isn't a direct media
+    file is handed to yt-dlp — its site extractors plus the generic fallback cover a huge range
+    of sites (YouTube, Rutube, VK, and arbitrary players like freehat.cc), and the result is
+    always re-encoded, so the renderer gets a safe stream rather than a raw page URL."""
+    if not text or not text.startswith(('http://', 'https://')):
         return False
-    host = text.split('://', 1)[-1].split('/', 1)[0].lower() if '://' in text else ''
-    return any(host == d or host.endswith('.' + d) for d in _EXTRACTABLE_DOMAINS) \
-        or any(d in text for d in _EXTRACTABLE_DOMAINS)
+    path = text.split('?', 1)[0].split('#', 1)[0].lower()
+    return not path.endswith(_DIRECT_MEDIA_EXT)
 
 # Back-compat alias for older call sites.
 is_youtube_url = is_extractable_url
@@ -855,6 +859,293 @@ class YoutubeStreamer:
             if self._dir and os.path.isdir(self._dir):
                 os.rmdir(self._dir)
         except OSError:
+            pass
+
+
+# Internet-radio + cover-art "visualiser" mode (AzuraCast stations like dnbradio.com).
+_RADIO_HOSTS = ('dnbradio.com', 'azura.dnbradio.com')
+_RADIO_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+             '(KHTML, like Gecko) Chrome/120 Safari/537.36')
+_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+    '/Library/Fonts/Arial Bold.ttf',
+    'C:/Windows/Fonts/arialbd.ttf',
+)
+
+def is_radio_url(text):
+    """True for an AzuraCast radio station page we render as audio + live cover art."""
+    if not text or not text.startswith(('http://', 'https://')):
+        return False
+    host = text.split('://', 1)[-1].split('/', 1)[0].lower()
+    return any(host == d or host.endswith('.' + d) for d in _RADIO_HOSTS)
+
+
+def _radio_get(url, timeout=15):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': _RADIO_UA}),
+                                  timeout=timeout)
+
+
+class RadioStreamer:
+    """Play an internet radio station on a TV with a live visual: the current track's cover art
+    stretched-and-blurred as a full-screen background (no black bars), the sharp cover centred,
+    and the track/artist + station text on top. Cover and text update as tracks change, without
+    interrupting the stream — Python renders frames (PIL) into ffmpeg's stdin while ffmpeg mixes
+    them with the live audio into MPEG-TS.
+    """
+    W, H, FPS = 1280, 720, 5
+
+    def __init__(self, page_url, port, callback=None):
+        self.page_url = page_url
+        self.port = port
+        self.callback = callback or (lambda m: None)
+        self.channel = 'main'
+        self.title = 'Radio'
+        self.proc = None
+        self.srv = None
+        self.thread = None
+        self._dir = None
+        self.path = None
+        self._frame = None
+        self._art_id = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._logo = None
+        self._font_big = self._font_small = None
+
+    def _resolve(self):
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.page_url).query)
+        self.channel = (q.get('channel', ['main'])[0]) or 'main'
+        # The page's ?channel= is not 1:1 with the AzuraCast station shortcode (main → dnbradio,
+        # jungletrain → jungletrain.net, …), so resolve it via the stations API and use the real
+        # listen URL + shortcode. Fall back to a direct guess if the API is unreachable.
+        shortcode = self.channel
+        self.stream_url = f'https://azura.dnbradio.com/listen/{self.channel}/radio.mp3'
+        try:
+            stations = json.loads(_radio_get('https://azura.dnbradio.com/api/stations', 15).read())
+            st = self._match_station(stations, self.channel)
+            if st:
+                shortcode = st.get('shortcode') or self.channel
+                self.stream_url = st.get('listen_url') or self.stream_url
+        except Exception as e:
+            self.callback(f"[RADIO] stations API: {e}")
+        self.nowplaying = f'https://azura.dnbradio.com/api/nowplaying/{shortcode}'
+        self.title = f'DnBRadio · {self.channel}'
+
+    @staticmethod
+    def _match_station(stations, channel):
+        ch = (channel or '').lower()
+        target = {'main': 'dnbradio'}.get(ch, ch)   # the site's "main" is the "dnbradio" station
+        for s in stations:                          # exact shortcode
+            if (s.get('shortcode') or '').lower() == target:
+                return s
+        for s in stations:                          # partial match either way
+            sc = (s.get('shortcode') or '').lower()
+            if sc and (sc.startswith(ch) or ch in sc or sc.split('.')[0] == ch):
+                return s
+        return stations[0] if stations else None
+
+    def _load_assets(self):
+        font_path = next((p for p in _FONT_CANDIDATES if os.path.exists(p)), None)
+        try:
+            self._font_big = ImageFont.truetype(font_path, 40) if font_path else ImageFont.load_default()
+            self._font_small = ImageFont.truetype(font_path, 26) if font_path else ImageFont.load_default()
+        except Exception:
+            self._font_big = self._font_small = ImageFont.load_default()
+        # station logo (best-effort)
+        try:
+            data = _radio_get('https://dnbradio.com/images/dnbradio_sq.png', 15).read()
+            logo = Image.open(io.BytesIO(data)).convert('RGBA')
+            logo.thumbnail((120, 120))
+            self._logo = logo
+        except Exception:
+            self._logo = None
+
+    def _text(self, d, text, font, y, fill=(255, 255, 255)):
+        if not text:
+            return
+        while d.textlength(text, font=font) > self.W - 80 and len(text) > 4:
+            text = text[:-2]
+        x = self.W // 2 - d.textlength(text, font=font) / 2
+        d.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0))
+        d.text((x, y), text, font=font, fill=fill)
+
+    def _render(self, art_bytes, artist, title):
+        W, H = self.W, self.H
+        if art_bytes:
+            cover = Image.open(io.BytesIO(art_bytes)).convert('RGB')
+        else:
+            cover = Image.new('RGB', (400, 400), (20, 20, 28))
+        bg = cover.resize((W, H)).filter(ImageFilter.GaussianBlur(40))   # stretched + blurred fill
+        frame = Image.blend(bg, Image.new('RGB', (W, H), (0, 0, 0)), 0.35)
+        # Always a fixed-size square cover (upscale tiny art, centre-crop non-square) so the cover
+        # never looks tiny regardless of the source art's resolution.
+        side = 470
+        cov = ImageOps.fit(cover, (side, side), method=Image.LANCZOS)
+        frame.paste(cov, (W // 2 - side // 2, 300 - side // 2))
+        d = ImageDraw.Draw(frame, 'RGBA')
+        self._text(d, (title or '').upper(), self._font_big, 540)
+        self._text(d, artist or '', self._font_small, 590, fill=(180, 210, 255))
+        self._text(d, f'DnBRadio · {self.channel}'.upper(), self._font_small, 40, fill=(150, 150, 160))
+        if self._logo:
+            frame.paste(self._logo, (W - self._logo.width - 24, H - self._logo.height - 24), self._logo)
+        return frame.tobytes()
+
+    def _update_now(self):
+        try:
+            j = json.loads(_radio_get(self.nowplaying).read())
+            song = j.get('now_playing', {}).get('song', {})
+            art_id = song.get('art') or song.get('id')
+            if art_id == self._art_id:
+                return
+            art_bytes = None
+            if song.get('art'):
+                try:
+                    art_bytes = _radio_get(song['art'], 20).read()
+                except Exception:
+                    art_bytes = None
+            fb = self._render(art_bytes, song.get('artist', ''), song.get('title', ''))
+            with self._lock:
+                self._art_id = art_id
+                self._frame = fb
+            self.callback(f"[RADIO] now playing: {song.get('artist','')} — {song.get('title','')}")
+        except Exception as e:
+            self.callback(f"[RADIO] nowplaying: {e}")
+
+    def start(self):
+        """Resolve the station, start ffmpeg + frame feeder + now-playing watcher + HTTP server.
+        Returns True on success."""
+        if not HAS_PIL:
+            self.callback("[RADIO] Pillow not installed — radio visual unavailable")
+            return False
+        import tempfile
+        self._resolve()
+        self._load_assets()
+        self._dir = tempfile.mkdtemp(prefix='casttotv_radio_')
+        self.path = os.path.join(self._dir, 'stream.ts')
+        self._update_now()
+        if self._frame is None:
+            self._frame = self._render(None, '', '')
+
+        ff = [resolve_binary('ffmpeg'), '-loglevel', 'error',
+              '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{self.W}x{self.H}',
+              '-framerate', str(self.FPS), '-i', 'pipe:0',
+              '-user_agent', _RADIO_UA, '-i', self.stream_url,
+              '-map', '0:v:0', '-map', '1:a:0',
+              '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'stillimage',
+              '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
+              '-r', str(self.FPS), '-g', str(self.FPS * 4), '-bf', '0',
+              '-maxrate', '1800k', '-bufsize', '3600k',
+              '-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
+        self.callback("[RADIO] starting ffmpeg (cover art + audio)...")
+        self._errlog = os.path.join(self._dir, 'ff.log')
+        self.proc = subprocess.Popen(ff, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=open(self._errlog, 'w'), preexec_fn=_PREEXEC)
+        proc = self.proc
+
+        def feeder():
+            interval = 1.0 / self.FPS
+            while proc.poll() is None and not self._stop:
+                with self._lock:
+                    fb = self._frame
+                try:
+                    proc.stdin.write(fb)
+                except Exception:
+                    break
+                time.sleep(interval)
+        threading.Thread(target=feeder, daemon=True).start()
+
+        def watcher():
+            while proc.poll() is None and not self._stop:
+                time.sleep(12)
+                self._update_now()
+        threading.Thread(target=watcher, daemon=True).start()
+
+        # prefill
+        for _ in range(80):
+            time.sleep(0.5)
+            try:
+                if os.path.getsize(self.path) > 700_000:
+                    break
+            except OSError:
+                pass
+            if proc.poll() is not None:
+                tail = ''
+                try:
+                    tail = open(self._errlog).read()[-300:]
+                except OSError:
+                    pass
+                self.callback(f"[RADIO] ffmpeg died: {tail}")
+                return False
+        self.callback(f"[RADIO] buffered {os.path.getsize(self.path)//1024} KB — streaming")
+        self._serve()
+        return True
+
+    def _serve(self):
+        streamer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _hdr(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('transferMode.dlna.org', 'Streaming')
+                self.send_header('contentFeatures.dlna.org',
+                                 'DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000')
+                self.end_headers()
+
+            def do_HEAD(self):
+                self._hdr()
+
+            def do_GET(self):
+                self._hdr()
+                stall = 0
+                try:
+                    with open(streamer.path, 'rb') as f:
+                        while stall < 600 and not streamer._stop:
+                            chunk = f.read(64 * 1024)
+                            if chunk:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                stall = 0
+                            else:
+                                time.sleep(0.1)
+                                stall += 1
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def log_message(self, *a):
+                _file_log(f"[RADIO-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
+
+        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
+        self.srv.allow_reuse_address = True
+        self.srv.daemon_threads = True
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        if self.srv:
+            try:
+                self.srv.shutdown()
+            finally:
+                try:
+                    self.srv.server_close()
+                except Exception:
+                    pass
+            self.srv = None
+            self.thread = None
+        try:
+            import shutil as _sh
+            if self._dir and os.path.isdir(self._dir):
+                _sh.rmtree(self._dir, ignore_errors=True)
+        except Exception:
             pass
 
 
@@ -1616,6 +1907,7 @@ class KeygenApp:
         self.http_server = None
         self.dongle_caster = None
         self.youtube_streamer = None
+        self.radio_streamer = None
         self._cc_casts = {}       # uuid -> pychromecast.Chromecast (live, from discovery)
         self._cc_browser = None   # kept alive for the session so cast objects stay connected
         self._airplay_confs = {}  # identifier -> pyatv config (from discovery)
@@ -2204,7 +2496,26 @@ class KeygenApp:
             video_mime = 'video/mp4'
             duration = None
             dlna_op = None
-            if is_extractable_url(video):
+            if is_radio_url(video):
+                # ---- Internet radio + live cover-art visual ----
+                self.log("[RADIO] Resolving station...")
+                if self.dongle_caster:
+                    self.dongle_caster.stop(); self.dongle_caster = None
+                if self.youtube_streamer:
+                    self.youtube_streamer.stop()
+                if self.radio_streamer:
+                    self.radio_streamer.stop()
+                streamer = RadioStreamer(video, self.server_port + 2, callback=self.log)
+                self.radio_streamer = streamer
+                if not streamer.start():
+                    self.log("[ERR] Could not start radio")
+                    self.status_lbl.config(text="FAILED", fg='#FF0000')
+                    return
+                local = get_local_ip()
+                url = f"http://{local}:{self.server_port + 2}/stream.ts"
+                name = streamer.title
+                video_mime = 'video/MP2T'
+            elif is_extractable_url(video):
                 # ---- Extractable URL (YouTube / Rutube / …): yt-dlp → ffmpeg → growing TS → DLNA ----
                 self.log("[YT] Resolving stream via yt-dlp...")
                 # Free the shared dongle port and any previous extracted stream.
@@ -2405,6 +2716,8 @@ class KeygenApp:
             self.dongle_caster.stop()
         if self.youtube_streamer:
             self.youtube_streamer.stop()
+        if self.radio_streamer:
+            self.radio_streamer.stop()
         if self._cc_browser is not None:
             try:
                 pychromecast.discovery.stop_discovery(self._cc_browser)
