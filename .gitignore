@@ -6,7 +6,10 @@ __pycache__/
 *.egg-info/
 *.spec
 !CastToTV.spec
+!CastToTV-linux.spec
 cast_log.txt
 
 
 .venv/
+
+vendor/
