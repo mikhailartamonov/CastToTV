@@ -711,11 +711,16 @@ class YoutubeStreamer:
         # H.264, HLS with segment-join discontinuities) make dongles freeze or show audio-only; a
         # re-encoded baseline stream is what every hardware decoder handles. Keyframe every ~2s.
         level = '4.0' if max_width > 1280 else '3.1'   # 4.0 needed for 1080p
-        maxrate = '10M' if max_width > 1280 else '6M'
+        # Strict CBR with a 1-second VBV buffer (nal-hrd=cbr pads to a constant rate). A cheap
+        # dongle's tiny decode buffer overruns on bitrate SPIKES; a large bufsize (the old 20M)
+        # lets complex scenes burst and choke it. A flat, constant feed is what its firmware can
+        # actually sustain — so we trade a little efficiency for a peak-free stream.
+        rate = '8M' if max_width > 1280 else '4M'
         cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
                 '-profile:v', 'baseline', '-level', level, '-pix_fmt', 'yuv420p',
                 '-vf', f"scale='min({max_width},iw)':-2", '-g', '48', '-bf', '0',
-                '-maxrate', maxrate, '-bufsize', '20M']
+                '-b:v', rate, '-minrate', rate, '-maxrate', rate, '-bufsize', rate,
+                '-x264-params', 'nal-hrd=cbr']
         cmd += ['-c:a', 'aac', '-ac', '2', '-b:a', '128k', '-f', 'mpegts', self.path]
         self.callback("[YT] Muxing stream to disk (ffmpeg)...")
         self._errlog = os.path.join(self._dir, 'ffmpeg.log')
