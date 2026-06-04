@@ -607,8 +607,9 @@ class YoutubeStreamer:
         self.url = url
         self.port = port
         self.callback = callback or (lambda m: None)
-        self.total_size = 0      # approximate, informational (the live stream has no fixed length)
-        self.duration = None
+        self.total_size = 0      # source filesize (bytes) from yt-dlp, if known
+        self.duration = None     # HH:MM:SS string (full video)
+        self.duration_seconds = 0
         self.title = None
         self._dir = None
         self.path = None         # growing .ts file on disk
@@ -618,6 +619,11 @@ class YoutubeStreamer:
         self._done = False        # ffmpeg finished muxing
         self._completed = False   # a client has streamed the file to EOF (→ don't replay)
         self._is_hls = False      # source is HLS (m3u8) → re-encode video, don't copy
+        # Declared byte length for the served stream (0 = unknown/live). When non-zero we send a
+        # Content-Length + OP=01 so the renderer shows a real total time instead of 00:00:00.
+        self.content_length = 0
+        self.play_duration = None   # HH:MM:SS the renderer should show (full − seek)
+        self.play_seconds = 0       # same as a float, for the DLNA TimeSeekRange npt header
         self._error = None
 
     def _ytdlp(self, *extra):
@@ -644,6 +650,7 @@ class YoutubeStreamer:
             return []
         self.title = info.get('title')
         if info.get('duration'):
+            self.duration_seconds = int(info['duration'])
             self.duration = format_duration(info['duration'])
         fmts = info.get('requested_formats') or ([info] if info.get('url') else [])
         urls = [f.get('url') for f in fmts if f.get('url')]
@@ -670,6 +677,12 @@ class YoutubeStreamer:
             cmd += ['-i', su]
         if len(stream_urls) == 2:
             cmd += ['-map', '0:v:0', '-map', '1:a:0']
+        remaining = max(1, self.duration_seconds - int(seek_seconds)) if self.duration_seconds else 0
+        self.play_duration = format_duration(remaining) if remaining else self.duration
+        # The real total time is reported to the renderer via the DLNA TimeSeekRange npt header
+        # (DLNA.ORG_OP=10) rather than a byte Content-Length — that's how Rygel/UMS make a
+        # transcoded stream of unknown size show its duration without muxing the whole thing.
+        self.play_seconds = remaining
         if self._is_hls:
             # HLS segments concatenated by `-c:v copy` leave timestamp discontinuities → dongles
             # freeze at segment joins. Re-encode to clean H.264. Use *baseline* (no B-frames, no
@@ -735,8 +748,17 @@ class YoutubeStreamer:
                 self.send_response(200)
                 self.send_header('Content-Type', 'video/MP2T')
                 self.send_header('transferMode.dlna.org', 'Streaming')
+                op = '00'
+                if streamer.play_seconds:
+                    # DLNA time-seek: report the real duration as the npt range end. This is how a
+                    # transcoded stream of unknown byte size tells the TV its total time (Rygel/UMS
+                    # do the same) — so the TV shows the real total instead of 00:00:00.
+                    dur = f'{streamer.play_seconds:.3f}'
+                    self.send_header('TimeSeekRange.dlna.org', f'npt=0.000-{dur}/{dur}')
+                    self.send_header('X-AvailableSeekRange', f'1 npt=0.000-{dur}')
+                    op = '10'
                 self.send_header('contentFeatures.dlna.org',
-                                 'DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000')
+                                 f'DLNA.ORG_OP={op};DLNA.ORG_FLAGS=01700000000000000000000000000000')
                 self.end_headers()
 
             def do_HEAD(self):
@@ -755,20 +777,30 @@ class YoutubeStreamer:
                     waited += 1
                 if not os.path.exists(streamer.path):
                     return
+                limit = streamer.content_length   # 0 = unbounded; else never send past the declared length
+                sent = 0
                 stall = 0
                 try:
                     with open(streamer.path, 'rb') as f:   # tail the growing file
                         while stall < 200:
+                            if limit and sent >= limit:
+                                break
                             chunk = f.read(64 * 1024)
                             if chunk:
+                                if limit and sent + len(chunk) > limit:
+                                    chunk = chunk[:limit - sent]
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
+                                sent += len(chunk)
                                 stall = 0
                             elif streamer._done:
                                 chunk = f.read(64 * 1024)   # final drain after ffmpeg exit
                                 if chunk:
+                                    if limit and sent + len(chunk) > limit:
+                                        chunk = chunk[:limit - sent]
                                     self.wfile.write(chunk)
                                     self.wfile.flush()
+                                    sent += len(chunk)
                                     continue
                                 streamer._completed = True  # reached true EOF — don't replay
                                 break
@@ -1301,16 +1333,18 @@ class MediaSource:
     Decouples *where the bytes come from* (local file / YouTube / Rutube / direct URL) from
     *which protocol plays it* (DLNA today; Chromecast / AirPlay slot in via play_on()).
     """
-    def __init__(self, url, mime='video/mp4', title='Video', duration=None, subtitle_url=None):
+    def __init__(self, url, mime='video/mp4', title='Video', duration=None, subtitle_url=None,
+                 dlna_op=None):
         self.url = url
         self.mime = mime
         self.title = title
         self.duration = duration
         self.subtitle_url = subtitle_url
+        self.dlna_op = dlna_op   # '10' to advertise time-seek (transcoded streams → TV shows duration)
 
 
 def cast_video(video_url, control_url, subtitle_url=None, title=None,
-               video_mime='video/mp4', duration=None, callback=None):
+               video_mime='video/mp4', duration=None, callback=None, dlna_op=None):
     """Send video to DLNA renderer. Minimal January-style DIDL (LG webOS UP7750PTB verified).
 
     Auto-recovers from 701 "Transition not available" by sending Stop and retrying SetURI.
@@ -1332,7 +1366,9 @@ def cast_video(video_url, control_url, subtitle_url=None, title=None,
     # video/mp4 в protocolInfo даже для MKV — LG webOS так умеет.
     # Минимум флагов: OP=01 + FLAGS=01700000... — НЕ добавлять PN/CI/size, они ломают LG.
     # Для MPEG-TS (video/MP2T) — OP=00 (no Range), флаги те же.
-    op = '00' if video_mime == 'video/MP2T' else '01'
+    # dlna_op='10' = time-seek (used for transcoded streams so the TV reads duration from the
+    # TimeSeekRange npt header). Otherwise OP=00 for MP2T (no range), OP=01 for files.
+    op = dlna_op or ('00' if video_mime == 'video/MP2T' else '01')
     proto = f'http-get:*:{video_mime}:DLNA.ORG_OP={op};DLNA.ORG_FLAGS=01700000000000000000000000000000'
     duration_attr = f' duration="{duration}"' if duration else ''
     didl = (f'<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
@@ -2046,7 +2082,8 @@ class KeygenApp:
         if protocol == 'dlna':
             return cast_video(source.url, target['control_url'],
                               subtitle_url=source.subtitle_url, video_mime=source.mime,
-                              duration=source.duration, title=source.title, callback=self.log)
+                              duration=source.duration, title=source.title, callback=self.log,
+                              dlna_op=getattr(source, 'dlna_op', None))
         if protocol == 'chromecast':
             return self._play_chromecast(target, source)
         if protocol == 'airplay':
@@ -2157,6 +2194,7 @@ class KeygenApp:
             sub_url = None
             video_mime = 'video/mp4'
             duration = None
+            dlna_op = None
             if is_extractable_url(video):
                 # ---- Extractable URL (YouTube / Rutube / …): yt-dlp → ffmpeg → growing TS → DLNA ----
                 self.log("[YT] Resolving stream via yt-dlp...")
@@ -2179,8 +2217,9 @@ class KeygenApp:
                 streamer.wait_prefill()
                 url = f"http://{local}:{self.server_port + 2}/stream.ts"
                 name = streamer.title or 'Stream'
-                duration = streamer.duration
+                duration = streamer.play_duration or streamer.duration
                 video_mime = 'video/MP2T'
+                dlna_op = '10' if streamer.play_seconds else None   # time-seek → TV shows duration
                 self.log(f"[YT] Streaming: {url}")
             elif video.startswith("http"):
                 url = video
@@ -2321,7 +2360,7 @@ class KeygenApp:
             self.status_lbl.config(text="CASTING...", fg='#FF6600')
             title = os.path.splitext(name)[0] if not video.startswith('http') and not is_extractable_url(video) else name
             source = MediaSource(url, mime=video_mime, title=title,
-                                 duration=duration, subtitle_url=sub_url)
+                                 duration=duration, subtitle_url=sub_url, dlna_op=dlna_op)
             if self.multi_var.get() and len(self.device_list) > 1:
                 targets = self._dedupe_targets(self.device_list)
                 self.log(f"[MULTI] Casting to {len(targets)} room(s), synchronised start...")
