@@ -331,8 +331,9 @@ class DongleCaster:
             def log_message(self, *a):
                 _file_log(f"[DONGLE-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
 
-        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
-        self.srv.allow_reuse_address = True
+        # SilentThreadingTCPServer sets allow_reuse_address as a CLASS attr (before bind) — setting
+        # it on the instance after construction is too late and leaves TIME_WAIT blocking restarts.
+        self.srv = SilentThreadingTCPServer(('0.0.0.0', self.port), Handler)
         self.srv.daemon_threads = True
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
@@ -862,8 +863,9 @@ class YoutubeStreamer:
             def log_message(self, *a):
                 _file_log(f"[YT-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
 
-        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
-        self.srv.allow_reuse_address = True
+        # SilentThreadingTCPServer sets allow_reuse_address as a CLASS attr (before bind) — setting
+        # it on the instance after construction is too late and leaves TIME_WAIT blocking restarts.
+        self.srv = SilentThreadingTCPServer(('0.0.0.0', self.port), Handler)
         self.srv.daemon_threads = True
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
@@ -1159,8 +1161,9 @@ class RadioStreamer:
             def log_message(self, *a):
                 _file_log(f"[RADIO-HTTP] {self.address_string()} " + (a[0] % a[1:] if a else ''))
 
-        self.srv = socketserver.ThreadingTCPServer(('0.0.0.0', self.port), Handler)
-        self.srv.allow_reuse_address = True
+        # SilentThreadingTCPServer sets allow_reuse_address as a CLASS attr (before bind) — setting
+        # it on the instance after construction is too late and leaves TIME_WAIT blocking restarts.
+        self.srv = SilentThreadingTCPServer(('0.0.0.0', self.port), Handler)
         self.srv.daemon_threads = True
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
