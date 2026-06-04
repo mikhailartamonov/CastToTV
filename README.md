@@ -174,6 +174,39 @@ five quirks no one writes down — all handled automatically:
 > screen over Wi-Fi Direct, so on Linux it's deferred to the system's
 > *Network Displays* helper rather than driven from here.
 
+### Streaming YouTube / Rutube to cheap HDMI dongles
+
+Casting an extracted web stream to a $12 AnyCast-class dongle is its own
+minefield — every one of these was found the hard way, casting real videos
+to real hardware, and is handled automatically now:
+
+1. **YouTube serves AV1 by default.** `bestvideo[ext=mp4]` is now `av01…`,
+   which cheap dongles can't decode — they play the audio and show a black
+   screen. The format selector is pinned to **H.264 (`avc1`)** so the dongle
+   gets a stream it decodes in hardware.
+2. **HLS sources (Rutube) freeze on segment joins.** Concatenating HLS
+   segments with `-c:v copy` leaves timestamp discontinuities and no repeated
+   SPS/PPS at the joins → the picture freezes there (audio keeps going). HLS
+   is detected and the video is **re-encoded** instead of copied.
+3. **Cheap decoders choke on B-frames / CABAC.** Even re-encoded `main`/`high`
+   H.264 can show frame 1 then freeze. The HLS re-encode uses **Constrained
+   Baseline** (`-profile:v baseline -bf 0`) — no B-frames, no CABAC — which
+   hardware decoders handle reliably.
+4. **1080p is often too heavy; 720p baseline is the sweet spot.** A dongle
+   that stutters on 1080p plays 720p baseline smoothly. Resolution is
+   selectable (`max_width`), default 720p for dongles.
+5. **Dongles loop on EOF.** A DLNA dongle re-requests the URL when it reaches
+   the end; the tail server used to replay from byte 0. It now serves the file
+   **once** and returns empty afterward, so playback stops at the end.
+6. **Dongles wedge if you yank the stream.** Killing the HTTP server mid-play
+   (or feeding an undecodable stream) can hang a cheap dongle's whole UPnP
+   stack until it's power-cycled — so stop with a proper DLNA `Stop`, and the
+   undecodable-stream cases above are exactly what's avoided now.
+
+The flip side: the source is muxed to a **disk-backed** growing file (not an
+in-memory buffer), so a 2-hour film can't OOM the app, and you can **resume
+from an offset** (`seek_seconds`) — handy when you doze off mid-movie.
+
 ## Case studies
 
 ### Case 1 — "Why does my movie play silent on the LG?"
